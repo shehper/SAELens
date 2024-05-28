@@ -191,15 +191,26 @@ def get_recons_loss(
         if activation_store.normalize_activations:
             activations = activation_store.unscale(activations)
         return activations
+    
+    def standard_zero_ablate_hook(activations: torch.Tensor, hook: Any):
+        activations = torch.zeros_like(activations)
+        return activations
+
+    def single_head_zero_ablate_hook(activations: torch.Tensor, hook: Any):
+        activations[:, :, head_index] = torch.zeros_like(activations[:, :, head_index])
+        return activations
 
     has_head_dim_key_substrings = ["hook_q", "hook_k", "hook_v", "hook_z"]
     if any(substring in hook_point for substring in has_head_dim_key_substrings):
         if head_index is None:
             replacement_hook = all_head_replacement_hook
+            zero_ablate_hook = standard_zero_ablate_hook
         else:
             replacement_hook = single_head_replacement_hook
+            zero_ablate_hook = single_head_zero_ablate_hook
     else:
         replacement_hook = standard_replacement_hook
+        zero_ablate_hook = standard_zero_ablate_hook
 
     recons_loss = model.run_with_hooks(
         batch_tokens,
@@ -223,9 +234,7 @@ def get_recons_loss(
     return score, loss, recons_loss, zero_abl_loss
 
 
-def zero_ablate_hook(activations: torch.Tensor, hook: Any):
-    activations = torch.zeros_like(activations)
-    return activations
+
 
 
 def kl_divergence_attention(y_true: torch.Tensor, y_pred: torch.Tensor):
