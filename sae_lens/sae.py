@@ -138,24 +138,11 @@ class SAE(HookedRootModule):
         # the z activations for hook_z SAEs. but don't know d_head if we split up the forward pass
         # into a separate encode and decode function.
         # this will cause errors if we call decode before encode.
-        self.reshape_fn_in = lambda x: x
-        self.reshape_fn_out = lambda x, d_head: x
-        self.d_head = None
         if self.cfg.hook_name.endswith("_z"):
-
-            def reshape_fn_in(x: torch.Tensor):
-                self.d_head = x.shape[-1]  # type: ignore
-                self.reshape_fn_in = lambda x: einops.rearrange(
-                    x, "... n_heads d_head -> ... (n_heads d_head)"
-                )
-                return einops.rearrange(x, "... n_heads d_head -> ... (n_heads d_head)")
-
-            self.reshape_fn_in = reshape_fn_in
-
-        if self.cfg.hook_name.endswith("_z"):
-            self.reshape_fn_out = lambda x, d_head: einops.rearrange(
-                x, "... (n_heads d_head) -> ... n_heads d_head", d_head=d_head
-            )
+            self.turn_on_forward_pass_hook_z_reshaping()
+        else:
+            # need to default the reshape fns
+            self.turn_off_forward_pass_hook_z_reshaping()
 
         self.setup()  # Required for `HookedRootModule`s
 
@@ -268,6 +255,19 @@ class SAE(HookedRootModule):
 
         return sae_out
 
+    @torch.no_grad()
+    def fold_W_dec_norm(self):
+        W_dec_norms = self.W_dec.norm(dim=-1).unsqueeze(1)
+        self.W_dec.data = self.W_dec.data / W_dec_norms
+        self.W_enc.data = self.W_enc.data * W_dec_norms.T
+        self.b_enc.data = self.b_enc.data * W_dec_norms.squeeze()
+
+    @torch.no_grad()
+    def fold_activation_norm_scaling_factor(
+        self, activation_norm_scaling_factor: float
+    ):
+        self.W_enc.data = self.W_enc.data * activation_norm_scaling_factor
+
     def save_model(self, path: str, sparsity: Optional[torch.Tensor] = None):
 
         if not os.path.exists(path):
@@ -351,46 +351,6 @@ class SAE(HookedRootModule):
             force_download=False,
         )
 
-        if "prepend_bos" not in cfg_dict:
-            # default to True for backwards compatibility
-            cfg_dict["prepend_bos"] = True
-
-        if "apply_b_dec_to_input" not in cfg_dict:
-            # default to True for backwards compatibility
-            cfg_dict["apply_b_dec_to_input"] = True
-
-        if "finetuning_scaling_factor" not in cfg_dict:
-            # default to False for backwards compatibility
-            cfg_dict["finetuning_scaling_factor"] = False
-
-        if "sae_lens_training_version" not in cfg_dict:
-            cfg_dict["sae_lens_training_version"] = None
-
-        if "activation_fn" not in cfg_dict:
-            cfg_dict["activation_fn_str"] = "relu"
-
-        if "normalize_activations" not in cfg_dict:
-            cfg_dict["normalize_activations"] = False
-
-        if "scaling_factor" in state_dict:
-            # we were adding it anyway for a period of time but are no longer doing so.
-            # so we should delete it if
-            if torch.allclose(
-                state_dict["scaling_factor"],
-                torch.ones_like(state_dict["scaling_factor"]),
-            ):
-                del state_dict["scaling_factor"]
-                cfg_dict["finetuning_scaling_factor"] = False
-            else:
-                assert cfg_dict[
-                    "finetuning_scaling_factor"
-                ], "Scaling factor is present but finetuning_scaling_factor is False."
-                state_dict["finetuning_scaling_factor"] = state_dict["scaling_factor"]
-                del state_dict["scaling_factor"]
-        else:
-            # it's there and it's not all 1's, we should use it.
-            cfg_dict["finetuning_scaling_factor"] = False
-
         sae = cls(SAEConfig.from_dict(cfg_dict))
         sae.load_state_dict(state_dict)
 
@@ -403,6 +363,32 @@ class SAE(HookedRootModule):
     @classmethod
     def from_dict(cls, config_dict: dict[str, Any]) -> "SAE":
         return cls(SAEConfig.from_dict(config_dict))
+
+    def turn_on_forward_pass_hook_z_reshaping(self):
+
+        assert self.cfg.hook_name.endswith(
+            "_z"
+        ), "This method should only be called for hook_z SAEs."
+
+        def reshape_fn_in(x: torch.Tensor):
+            self.d_head = x.shape[-1]  # type: ignore
+            self.reshape_fn_in = lambda x: einops.rearrange(
+                x, "... n_heads d_head -> ... (n_heads d_head)"
+            )
+            return einops.rearrange(x, "... n_heads d_head -> ... (n_heads d_head)")
+
+        self.reshape_fn_in = reshape_fn_in
+
+        self.reshape_fn_out = lambda x, d_head: einops.rearrange(
+            x, "... (n_heads d_head) -> ... n_heads d_head", d_head=d_head
+        )
+        self.hook_z_reshaping_mode = True
+
+    def turn_off_forward_pass_hook_z_reshaping(self):
+        self.reshape_fn_in = lambda x: x
+        self.reshape_fn_out = lambda x, d_head: x
+        self.d_head = None
+        self.hook_z_reshaping_mode = False
 
 
 def get_activation_fn(activation_fn: str) -> Callable[[torch.Tensor], torch.Tensor]:

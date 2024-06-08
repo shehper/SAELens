@@ -2,6 +2,74 @@
 
 
 
+## v3.2.3 (2024-06-05)
+
+### Fix
+
+* fix: allow tutorial packages for colab install to use latest version (#173)
+
+fix: allow tutorial packages for colab install to use latest version (#173) ([`f73cb73`](https://github.com/jbloomAus/SAELens/commit/f73cb73072e006f6dda0984e05e8accda014a2d8))
+
+### Unknown
+
+* fix pip install in HookedSAETransformer Demo (#172) ([`5d0faed`](https://github.com/jbloomAus/SAELens/commit/5d0faedf868d6e68035527a52ba718807e8ed196))
+
+
+## v3.2.2 (2024-06-02)
+
+### Fix
+
+* fix: removing truncation in activations store data loading (#62) ([`43c93e2`](https://github.com/jbloomAus/SAELens/commit/43c93e2c3e19e9e9d81b48d3a472d894dac83d65))
+
+
+## v3.2.1 (2024-06-02)
+
+### Fix
+
+* fix: moving non-essential deps to dev (#121) ([`1a2cde0`](https://github.com/jbloomAus/SAELens/commit/1a2cde04d306061e7765a61e44d77ad1f3f8a1d4))
+
+
+## v3.2.0 (2024-05-30)
+
+### Feature
+
+* feat: activation norm scaling factor folding (#170)
+
+* feat: add convenience function for folding scaling factor
+
+* keep playing around with benchmark ([`773e308`](https://github.com/jbloomAus/SAELens/commit/773e30898bb0957d4c9bd79343776ff3e225d13c))
+
+
+## v3.1.1 (2024-05-29)
+
+### Fix
+
+* fix: share config defaulting between hf and local loading (#169) ([`7df479c`](https://github.com/jbloomAus/SAELens/commit/7df479c3a1e4d2ed187090ef65c5059f6fa8bf24))
+
+
+## v3.1.0 (2024-05-29)
+
+### Feature
+
+* feat: add w_dec_norm folding (#167)
+
+* feat: add w_dec_norm folding
+
+* format ([`f1908a3`](https://github.com/jbloomAus/SAELens/commit/f1908a39b3d78a03288ca721aa18fc5bfbf9b83e))
+
+### Unknown
+
+* Fixed typo in Hooked_SAE_Transformer_Demo.ipynb preventing Open in Colab badge from working (#166)
+
+Minor typo in file name was preventing Hooked_SAE_Transformer_Demo.ipynb &#34;Open in Colab&#34; badge from working. ([`4850b16`](https://github.com/jbloomAus/SAELens/commit/4850b16a17c08ef39a8df74a5f4df5074395474b))
+
+* Fix hook z training reshape bug (#165)
+
+* remove file duplicate
+
+* fix: hook-z evals working, and reshaping mode more explicit ([`0550ae3`](https://github.com/jbloomAus/SAELens/commit/0550ae3defe778e08a050faff5e1345aee6de1a4))
+
+
 ## v3.0.0 (2024-05-28)
 
 ### Breaking

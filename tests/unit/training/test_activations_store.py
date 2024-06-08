@@ -1,6 +1,7 @@
 from collections.abc import Iterable
 from math import ceil
 
+import numpy as np
 import pytest
 import torch
 from datasets import Dataset, IterableDataset
@@ -233,6 +234,20 @@ def test_activations_store__get_next_dataset_tokens__tokenizes_each_example_in_o
     )
 
 
+def test_activations_store__get_next_dataset_tokens__can_handle_long_examples(
+    ts_model: HookedTransformer,
+):
+    cfg = build_sae_cfg()
+    dataset = Dataset.from_list(
+        [
+            {"text": " France" * 3000},
+        ]
+    )
+    activation_store = ActivationsStore.from_config(ts_model, cfg, dataset=dataset)
+
+    assert len(activation_store._get_next_dataset_tokens().tolist()) == 3001
+
+
 def test_activations_store_goes_to_cpu(ts_model: HookedTransformer):
     cfg = build_sae_cfg(act_store_device="cpu")
     activation_store = ActivationsStore.from_config(ts_model, cfg)
@@ -255,3 +270,23 @@ def test_activations_store_moves_with_model(ts_model: HookedTransformer):
     activation_store = ActivationsStore.from_config(ts_model.to("cuda:0"), cfg)  # type: ignore
     activations = activation_store.next_batch()
     assert activations.device == torch.device("cuda:0")
+
+
+def test_activations_store_estimate_norm_scaling_factor(
+    cfg: LanguageModelSAERunnerConfig, model: HookedTransformer
+):
+    # --- first, test initialisation ---
+
+    # config if you want to benchmark this:
+    #
+    # cfg.context_size = 1024
+    # cfg.n_batches_in_buffer = 64
+    # cfg.store_batch_size_prompts = 16
+
+    store = ActivationsStore.from_config(model, cfg)
+
+    factor = store.estimate_norm_scaling_factor(n_batches_for_norm_estimate=10)
+    assert isinstance(factor, float)
+
+    scaled_norm = store._storage_buffer.norm(dim=-1).mean() * factor  # type: ignore
+    assert scaled_norm == pytest.approx(np.sqrt(store.d_in), abs=5)
