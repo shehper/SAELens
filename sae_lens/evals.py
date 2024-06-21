@@ -65,11 +65,13 @@ def run_evals(
         original_act = cache[hook_name]
 
     # normalise if necessary
-    if activation_store.normalize_activations:
+    if activation_store.normalize_activations == "expected_average_only_in":
         original_act = activation_store.apply_norm_scaling_factor(original_act)
 
     # send the (maybe normalised) activations into the SAE
-    sae_out = sae.decode(sae.encode(original_act))
+    sae_out = sae.decode(sae.encode(original_act.to(sae.device))).to(
+        original_act.device
+    )
     del cache
 
     l2_norm_in = torch.norm(original_act, dim=-1)
@@ -147,21 +149,30 @@ def get_recons_loss(
 
     # TODO(tomMcGrath): the rescaling below is a bit of a hack and could probably be tidied up
     def standard_replacement_hook(activations: torch.Tensor, hook: Any):
+
+        original_device = activations.device
+        activations = activations.to(sae.device)
+
         # Handle rescaling if SAE expects it
-        if activation_store.normalize_activations:
+        if activation_store.normalize_activations == "expected_average_only_in":
             activations = activation_store.apply_norm_scaling_factor(activations)
 
         # SAE class agnost forward forward pass.
         activations = sae.decode(sae.encode(activations)).to(activations.dtype)
 
         # Unscale if activations were scaled prior to going into the SAE
-        if activation_store.normalize_activations:
+        if activation_store.normalize_activations == "expected_average_only_in":
             activations = activation_store.unscale(activations)
-        return activations
+
+        return activations.to(original_device)
 
     def all_head_replacement_hook(activations: torch.Tensor, hook: Any):
+
+        original_device = activations.device
+        activations = activations.to(sae.device)
+
         # Handle rescaling if SAE expects it
-        if activation_store.normalize_activations:
+        if activation_store.normalize_activations == "expected_average_only_in":
             activations = activation_store.apply_norm_scaling_factor(activations)
 
         # SAE class agnost forward forward pass.
@@ -174,14 +185,18 @@ def get_recons_loss(
         )  # reshape to match original shape
 
         # Unscale if activations were scaled prior to going into the SAE
-        if activation_store.normalize_activations:
+        if activation_store.normalize_activations == "expected_average_only_in":
             new_activations = activation_store.unscale(new_activations)
 
-        return new_activations
+        return new_activations.to(original_device)
 
     def single_head_replacement_hook(activations: torch.Tensor, hook: Any):
+
+        original_device = activations.device
+        activations = activations.to(sae.device)
+
         # Handle rescaling if SAE expects it
-        if activation_store.normalize_activations:
+        if activation_store.normalize_activations == "expected_average_only_in":
             activations = activation_store.apply_norm_scaling_factor(activations)
 
         new_activations = sae.decoder(sae.encode(activations[:, :, head_index])).to(
@@ -190,13 +205,15 @@ def get_recons_loss(
         activations[:, :, head_index] = new_activations
 
         # Unscale if activations were scaled prior to going into the SAE
-        if activation_store.normalize_activations:
+        if activation_store.normalize_activations == "expected_average_only_in":
             activations = activation_store.unscale(activations)
-        return activations
+        return activations.to(original_device)
 
     def zero_ablate_hook(activations: torch.Tensor, hook: Any):
+        original_device = activations.device
+        activations = activations.to(sae.device)
         activations = torch.zeros_like(activations)
-        return activations
+        return activations.to(original_device)
 
     # we would include hook z, except that we now have base SAE's
     # which will do their own reshaping for hook z.

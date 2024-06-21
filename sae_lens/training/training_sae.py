@@ -119,13 +119,18 @@ class TrainingSAEConfig(SAEConfig):
             "finetuning_scaling_factor": self.finetuning_scaling_factor,
             "normalize_activations": self.normalize_activations,
             "dataset_path": self.dataset_path,
+            "dataset_trust_remote_code": self.dataset_trust_remote_code,
             "sae_lens_training_version": self.sae_lens_training_version,
         }
 
 
 class TrainingSAE(SAE):
+    """
+    A SAE used for training. This class provides a `training_forward_pass` method which calculates
+    losses used for training.
+    """
 
-    cfg: TrainingSAEConfig  # type: ignore
+    cfg: TrainingSAEConfig
     use_error_term: bool
     dtype: torch.dtype
     device: torch.device
@@ -152,6 +157,9 @@ class TrainingSAE(SAE):
     def encode(
         self, x: Float[torch.Tensor, "... d_in"]
     ) -> Float[torch.Tensor, "... d_sae"]:
+        """
+        Calcuate SAE features from inputs
+        """
         feature_acts, _ = self.encode_with_hidden_pre(x)
         return feature_acts
 
@@ -167,6 +175,9 @@ class TrainingSAE(SAE):
 
         # apply b_dec_to_input if using that method.
         sae_in = self.hook_sae_input(x - (self.b_dec * self.cfg.apply_b_dec_to_input))
+
+        # handle run time activation normalization if needed
+        x = self.run_time_activation_norm_fn_in(x)
 
         # "... d_in, d_in d_sae -> ... d_sae",
         hidden_pre = self.hook_sae_acts_pre(sae_in @ self.W_enc + self.b_enc)
@@ -192,7 +203,7 @@ class TrainingSAE(SAE):
         sae_in: torch.Tensor,
         current_l1_coefficient: float,
         dead_neuron_mask: Optional[torch.Tensor] = None,
-    ) -> TrainStepOutput:  # type: ignore
+    ) -> TrainStepOutput:
 
         # do a forward pass to get SAE out, but we also need the
         # hidden pre.
@@ -305,7 +316,7 @@ class TrainingSAE(SAE):
             return standard_mse_loss_fn
 
     @classmethod
-    def load_from_pretrained(  # type: ignore
+    def load_from_pretrained(
         cls,
         path: str,
         device: str = "cpu",

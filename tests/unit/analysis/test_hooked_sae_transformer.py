@@ -54,10 +54,11 @@ def get_hooked_sae(model: HookedTransformer, act_name: str) -> SAE:
         prepend_bos=True,
         context_size=128,
         dataset_path="test",
+        dataset_trust_remote_code=True,
         apply_b_dec_to_input=False,
         finetuning_scaling_factor=False,
         sae_lens_training_version=None,
-        normalize_activations=False,
+        normalize_activations="none",
     )
 
     return SAE(sae_cfg)  # type: ignore

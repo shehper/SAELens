@@ -44,6 +44,9 @@ class TrainSAEOutput:
 
 
 class SAETrainer:
+    """
+    Core SAE class used for inference. For training, see TrainingSAE.
+    """
 
     def __init__(
         self,
@@ -95,8 +98,8 @@ class SAETrainer:
             sae.parameters(),
             lr=cfg.lr,
             betas=(
-                cfg.adam_beta1,  # type: ignore
-                cfg.adam_beta2,  # type: ignore
+                cfg.adam_beta1,
+                cfg.adam_beta2,
             ),
         )
         assert cfg.lr_end is not None  # this is set in config post-init
@@ -153,7 +156,7 @@ class SAETrainer:
         # Train loop
         while self.n_training_tokens < self.cfg.total_training_tokens:
             # Do a training step.
-            layer_acts = self.activation_store.next_batch()[:, 0, :]
+            layer_acts = self.activation_store.next_batch()[:, 0, :].to(self.sae.device)
             self.n_training_tokens += self.cfg.train_batch_size_tokens
 
             step_output = self._train_step(sae=self.sae, sae_in=layer_acts)
@@ -181,7 +184,7 @@ class SAETrainer:
 
     @torch.no_grad()
     def _estimate_norm_scaling_factor_if_needed(self) -> None:
-        if self.cfg.normalize_activations:
+        if self.cfg.normalize_activations == "expected_average_only_in":
             self.activation_store.estimated_norm_scaling_factor = (
                 self.activation_store.estimate_norm_scaling_factor()
             )
@@ -314,8 +317,8 @@ class SAETrainer:
                 model_kwargs=self.cfg.model_kwargs,
             )
 
-            W_dec_norm_dist = self.sae.W_dec.norm(dim=1).detach().cpu().numpy()
-            b_e_dist = self.sae.b_enc.detach().cpu().numpy()
+            W_dec_norm_dist = self.sae.W_dec.norm(dim=1).detach().float().cpu().numpy()
+            b_e_dist = self.sae.b_enc.detach().float().cpu().numpy()
 
             # More detail on loss.
 
@@ -368,13 +371,13 @@ class SAETrainer:
             self.checkpoint_thresholds.pop(0)
 
     @torch.no_grad()
-    def _update_pbar(self, step_output: TrainStepOutput, pbar: tqdm):  # type: ignore
+    def _update_pbar(self, step_output: TrainStepOutput, pbar: tqdm, update_interval: int = 100):  # type: ignore
 
-        if self.n_training_steps % 100 == 0:
+        if self.n_training_steps % update_interval == 0:
             pbar.set_description(
                 f"{self.n_training_steps}| MSE Loss {step_output.mse_loss:.3f} | L1 {step_output.l1_loss:.3f}"
             )
-            pbar.update(self.cfg.train_batch_size_tokens)
+            pbar.update(update_interval * self.cfg.train_batch_size_tokens)
 
     def _begin_finetuning_if_needed(self):
         if (not self.started_fine_tuning) and (

@@ -2,6 +2,101 @@
 
 
 
+## v3.5.0 (2024-06-20)
+
+### Feature
+
+* feat: trigger release ([`1a4663b`](https://github.com/jbloomAus/SAELens/commit/1a4663b7eadb42682586697e72192346c66cf430))
+
+### Unknown
+
+*  Performance improvements + using multiple GPUs.  (#189)
+
+* fix: no grads when filling cache
+
+* trainer should put activations on sae device
+
+* hack to allow sae device to be specific gpu when model is on multiple devices
+
+* add some tests (not in CI, which check multiple GPU performance
+
+* make formatter typer happy
+
+* make sure SAE calls move data between devices as needed ([`400474e`](https://github.com/jbloomAus/SAELens/commit/400474eaf758d57ea4090fd08e84cbdd91d55cc4))
+
+
+## v3.4.1 (2024-06-17)
+
+### Fix
+
+* fix: allow settings trust_remote_code for new huggingface version (#187)
+
+* fix: allow settings trust_remote_code for new huggingface version
+
+* default to True, not none
+
+---------
+
+Co-authored-by: jbloomAus &lt;jbloomaus@gmail.com&gt; ([`33a612d`](https://github.com/jbloomAus/SAELens/commit/33a612d7f694390a5a4596f7e15e0c51657634ba))
+
+
+## v3.4.0 (2024-06-14)
+
+### Feature
+
+* feat: Adding Mistral SAEs (#178)
+
+Note: normalize_activations is now a string and should be either &#39;none&#39;, &#39;expected_average_only_in&#39; (Anthropic April Update, not yet folded), &#39;constant_norm_rescale&#39; (Anthropic Feb update). 
+
+* Adding code to load mistral saes
+
+* Black formatting
+
+* Removing library changes that allowed forward pass normalization
+
+* feat: support feb update style norm scaling for mistral saes
+
+* Adding code to load mistral saes
+
+* Black formatting
+
+* Removing library changes that allowed forward pass normalization
+
+* Adding code to load mistral saes
+
+* Black formatting
+
+* Removing library changes that allowed forward pass normalization
+
+* feat: support feb update style norm scaling for mistral saes
+
+* remove accidental inclusion
+
+---------
+Co-authored-by: jbloomAus &lt;jbloomaus@gmail.com&gt; ([`227d208`](https://github.com/jbloomAus/SAELens/commit/227d2089f6fdadb54b5554056eb7721574608b58))
+
+### Unknown
+
+* Update README.md Slack Link Expired (this one shouldn&#39;t expire) ([`209696a`](https://github.com/jbloomAus/SAELens/commit/209696a4f74007559a650ad5357c4fd923205923))
+
+* add expected perf for pretrained (#179)
+
+Co-authored-by: jbloom-md &lt;joseph@massdynamics.com&gt; ([`10bd9c5`](https://github.com/jbloomAus/SAELens/commit/10bd9c58fd4d731bd453e49943d40f2ac01ff0fc))
+
+* fix progress bar updates (#171) ([`4d92975`](https://github.com/jbloomAus/SAELens/commit/4d92975cc1aa8cd7485e73597fd52e13a0f8e44e))
+
+
+## v3.3.0 (2024-06-10)
+
+### Feature
+
+* feat: updating docs and standardizing PretokenizeRunner export (#176) ([`03f071b`](https://github.com/jbloomAus/SAELens/commit/03f071b41e77ef07c8f8b892e52969337f5e94aa))
+
+### Unknown
+
+* add tutorial (#175) ([`8c67c23`](https://github.com/jbloomAus/SAELens/commit/8c67c2355211910bc5054ba9bc140e98424fa026))
+
+
 ## v3.2.3 (2024-06-05)
 
 ### Fix
