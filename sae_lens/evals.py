@@ -69,9 +69,15 @@ def run_evals(
         original_act = activation_store.apply_norm_scaling_factor(original_act)
 
     # send the (maybe normalised) activations into the SAE
-    sae_out = sae.decode(sae.encode(original_act.to(sae.device))).to(
-        original_act.device
-    )
+    if sae.cfg.architecture == "block_diag":
+        encode_out, _ = sae.encode_fn(original_act.to(sae.device))
+        sae_out = sae.decode_fn(encode_out).to(
+            original_act.device
+        )      
+    else:
+        sae_out = sae.decode(sae.encode(original_act.to(sae.device))).to(
+            original_act.device
+        )
 
     if activation_store.normalize_activations == "expected_average_only_in":
         sae_out = activation_store.unscale(sae_out)
@@ -180,9 +186,17 @@ def get_recons_loss(
             activations = activation_store.apply_norm_scaling_factor(activations)
 
         # SAE class agnost forward forward pass.
-        new_activations = sae.decode(sae.encode(activations.flatten(-2, -1))).to(
-            activations.dtype
-        )
+        if sae.cfg.architecture == "block_diag":
+            # print(f"I am here.")
+            encode_out, _ = sae.encode_fn(activations.flatten(-2, -1))
+            # print(f"encode out shape: {encode_out.shape}")
+            new_activations = sae.decode_fn(encode_out).to(
+                activations.dtype
+            )        
+        else:
+            new_activations = sae.decode(sae.encode(activations.flatten(-2, -1))).to(
+                activations.dtype
+            )        
 
         new_activations = new_activations.reshape(
             activations.shape

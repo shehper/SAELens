@@ -40,6 +40,7 @@ class TrainStepOutput:
 class TrainingSAEConfig(SAEConfig):
 
     # Sparsity Loss Calculations
+    n_heads: Optional[int] # TODO hack
     l1_coefficient: float
     lp_norm: float
     use_ghost_grads: bool
@@ -63,6 +64,7 @@ class TrainingSAEConfig(SAEConfig):
             d_sae=cfg.d_sae,  # type: ignore
             dtype=cfg.dtype,
             device=cfg.device,
+            n_heads=cfg.n_heads, # TODO: replace the hack
             model_name=cfg.model_name,
             hook_name=cfg.hook_name,
             hook_layer=cfg.hook_layer,
@@ -114,6 +116,7 @@ class TrainingSAEConfig(SAEConfig):
     # parameters. Maybe there's a cleaner way to do this
     def get_base_sae_cfg_dict(self) -> dict[str, Any]:
         return {
+            "n_heads": self.n_heads, # TODO hacky
             "architecture": self.architecture,
             "d_in": self.d_in,
             "d_sae": self.d_sae,
@@ -153,17 +156,22 @@ class TrainingSAE(SAE):
         super().__init__(base_sae_cfg)
         self.cfg = cfg  # type: ignore
 
-        self.encode_with_hidden_pre_fn = (
-            self.encode_with_hidden_pre
-            if cfg.architecture != "gated"
-            else self.encode_with_hidden_pre_gated
-        )
+        if self.cfg.architecture == "block_diag":
+            self.encode_with_hidden_pre_fn = self.encode_block_diag
+            self.decode_fn = self.decode_block_diag
+        else:
+            self.encode_with_hidden_pre_fn = (
+                self.encode_with_hidden_pre
+                if cfg.architecture != "gated"
+                else self.encode_with_hidden_pre_gated
+            )
+            self.decode_fn = self.decode
 
         self.check_cfg_compatibility()
 
         self.use_error_term = use_error_term
 
-        self.initialize_weights_complex()
+        # self.initialize_weights_complex()
 
         # The training SAE will assume that the activation store handles
         # reshaping.
@@ -268,7 +276,7 @@ class TrainingSAE(SAE):
         # do a forward pass to get SAE out, but we also need the
         # hidden pre.
         feature_acts, _ = self.encode_with_hidden_pre_fn(sae_in)
-        sae_out = self.decode(feature_acts)
+        sae_out = self.decode_fn(feature_acts)
 
         # MSE LOSS
         per_item_mse_loss = self.mse_loss_fn(sae_out, sae_in)
@@ -312,9 +320,22 @@ class TrainingSAE(SAE):
             ).mean()
 
             loss = mse_loss + l1_loss + aux_reconstruction_loss
-        else:
+        elif self.cfg.architecture == "standard":
             # default SAE sparsity loss
             weighted_feature_acts = feature_acts * self.W_dec.norm(dim=1)
+            sparsity = weighted_feature_acts.norm(
+                p=self.cfg.lp_norm, dim=-1
+            )  # sum over the feature dimension
+
+            l1_loss = (current_l1_coefficient * sparsity).mean()
+            loss = mse_loss + l1_loss + ghost_grad_loss
+
+            aux_reconstruction_loss = torch.tensor(0.0)
+        elif self.cfg.architecture == "block_diag":
+            
+            W_dec = self.get_W_dec()
+
+            weighted_feature_acts = feature_acts * W_dec.norm(dim=1)
             sparsity = weighted_feature_acts.norm(
                 p=self.cfg.lp_norm, dim=-1
             )  # sum over the feature dimension

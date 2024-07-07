@@ -126,8 +126,11 @@ class LanguageModelSAERunnerConfig:
         None  # Defaults to "activations/{dataset}/{model}/{full_hook_name}_{hook_head_index}"
     )
 
+    # hack # TODO: replace the hack with sth proper
+    n_heads: Optional[int] = 8 if model_name == "gelu-2l" else 12 if model_name == "gpt2-small" else None
+
     # SAE Parameters
-    architecture: Literal["standard", "gated"] = "standard"
+    architecture: Literal["standard", "gated", "block_diag"] = "standard"
     d_in: int = 512
     d_sae: Optional[int] = None
     b_dec_init_method: str = "geometric_median"
@@ -356,6 +359,7 @@ class LanguageModelSAERunnerConfig:
     def get_base_sae_cfg_dict(self) -> dict[str, Any]:
         return {
             # TEMP
+            "n_heads": self.n_heads, # TODO: hacky
             "architecture": self.architecture,
             "d_in": self.d_in,
             "d_sae": self.d_sae,

@@ -30,7 +30,7 @@ SAE_CFG_PATH = "cfg.json"
 @dataclass
 class SAEConfig:
     # architecture details
-    architecture: Literal["standard", "gated"]
+    architecture: Literal["standard", "gated", "block_diag"]
 
     # forward pass details.
     d_in: int
@@ -38,6 +38,9 @@ class SAEConfig:
     activation_fn_str: str
     apply_b_dec_to_input: bool
     finetuning_scaling_factor: bool
+
+    # TODO: hacky
+    n_heads: Optional[int]
 
     # dataset it was trained on details.
     context_size: int
@@ -135,6 +138,16 @@ class SAE(HookedRootModule):
         elif self.cfg.architecture == "gated":
             self.initialize_weights_gated()
             self.encode_fn = self.encode_gated
+        elif self.cfg.architecture == "block_diag":
+            assert self.cfg.hook_name.endswith("_z"), "This architecture should only be used for hook_z SAEs."
+            # TODO: hack
+            assert self.cfg.d_in % self.cfg.n_heads == 0
+            self.d_head = self.cfg.d_in // self.cfg.n_heads
+            self.initialize_weights_block_diag()
+            self.encode_fn = self.encode_block_diag
+            self.decode_fn = self.decode_block_diag
+            # TODO: what is self.encode?
+            # TODO: assert that block_diag expects concatenated hook_z.
 
         # handle presence / absence of scaling factor.
         if self.cfg.finetuning_scaling_factor:
@@ -276,6 +289,141 @@ class SAE(HookedRootModule):
             torch.zeros(self.cfg.d_in, dtype=self.dtype, device=self.device)
         )
 
+    def get_W_dec(self):
+        n_blocks = self.cfg.n_heads
+        return torch.block_diag(*[self.dec_blocks[str(i)].weight.t() for i in range(n_blocks)])
+    
+    def get_W_enc(self):
+        n_blocks = self.cfg.n_heads
+        return torch.block_diag(*[self.enc_blocks[str(i)].weight.t() for i in range(n_blocks)])
+    
+    def get_b_enc(self):
+        n_blocks = self.cfg.n_heads
+        return torch.cat([self.enc_blocks[str(i)].bias for i in range(n_blocks)])
+    
+    def get_b_dec(self):
+        n_blocks = self.cfg.n_heads
+        return torch.cat([self.dec_blocks[str(i)].bias for i in range(n_blocks)])
+
+    def initialize_weights_block_diag(self):
+
+        d_in = self.cfg.d_in
+        n_heads = self.cfg.n_heads
+        d_sae = self.cfg.d_sae
+
+        d_head = d_in // n_heads
+        d_sae_per_head = d_sae // n_heads
+
+        self.enc_blocks = nn.ModuleDict(
+            {str(i): 
+             nn.Linear(d_head, d_sae_per_head).to(device=self.device) 
+             for i in range(n_heads)
+            }
+        )
+        
+        self.dec_blocks = nn.ModuleDict(
+            {str(i): 
+             nn.Linear(d_sae_per_head, d_head).to(device=self.device) 
+             for i in range(n_heads)
+            }
+        )
+        
+        # TODO: include parameteter initialization
+
+    def encode_block_diag(
+        self, x: Float[torch.Tensor, "... d_in"]
+    ) -> Float[torch.Tensor, "... d_sae"]:
+        """
+        Calculate SAE features from inputs
+        """
+
+        W_enc = self.get_W_enc()
+        b_enc = self.get_b_enc()
+        b_dec = self.get_b_dec()
+
+        # move x to correct dtype
+        x = x.to(self.dtype)
+
+        # handle hook z reshaping if needed.
+        x = self.reshape_fn_in(x)  # type: ignore
+
+        # handle run time activation normalization if needed
+        x = self.run_time_activation_norm_fn_in(x)
+
+        # apply b_dec_to_input if using that method.
+        sae_in = self.hook_sae_input(x - (b_dec * self.cfg.apply_b_dec_to_input))
+
+        # "... d_in, d_in d_sae -> ... d_sae",
+        hidden_pre = self.hook_sae_acts_pre(sae_in @ W_enc + b_enc)
+        feature_acts = self.hook_sae_acts_post(self.activation_fn(hidden_pre))
+
+        return feature_acts, hidden_pre
+
+    def decode_block_diag(
+        self, feature_acts: Float[torch.Tensor, "... d_sae"]
+    ) -> Float[torch.Tensor, "... d_in"]:
+        """Decodes SAE feature activation tensor into a reconstructed input activation tensor."""
+        # "... d_sae, d_sae d_in -> ... d_in",
+
+        W_dec = self.get_W_dec()
+        b_dec = self.get_b_dec()
+
+        sae_out = self.hook_sae_recons(
+            self.apply_finetuning_scaling_factor(feature_acts) @ W_dec + b_dec
+        )
+
+        # handle run time activation normalization if needed
+        # will fail if you call this twice without calling encode in between.
+        sae_out = self.run_time_activation_norm_fn_out(sae_out)
+
+        # handle hook z reshaping if needed.
+        sae_out = self.reshape_fn_out(sae_out, self.d_head)  # type: ignore
+
+        return sae_out
+
+    def encode_block_diag_old(self, x):
+        n_blocks = self.cfg.n_heads
+        n_in = self.cfg.d_in 
+        outs = []
+
+        for i in range(n_blocks):
+            # slice x
+            start_id = i * n_in // n_blocks
+            end_id = (i + 1) * n_in // n_blocks
+            input = x.index_select(-1, torch.arange(start_id, end_id, device=self.device))
+
+            # forward pass for sliced x
+            pre_relu_latents = self.enc_blocks[str(i)](input)
+            latents = self.activation_fn(pre_relu_latents)
+
+            # append
+            outs.append(latents)
+
+        outs = torch.cat(outs, dim=-1)
+        # TODO: hacky, the second argument should not be None. It should be related to hidden_pre.
+        return outs, None 
+
+    def decode_block_diag_old(self, feature_acts):
+        n_blocks = self.cfg.n_heads
+        n_latents = self.cfg.d_sae
+        outs = []
+
+        for i in range(n_blocks):
+            # slice x
+            start_id = i * n_latents // n_blocks
+            end_id = (i + 1) * n_latents // n_blocks
+            input = feature_acts.index_select(-1, torch.arange(start_id, end_id, device=self.device))
+
+            # forward pass for sliced x
+            reconst = self.dec_blocks[str(i)](input)
+
+            # append
+            outs.append(reconst)
+        
+        outs = torch.cat(outs, dim=-1)
+
+        return outs
+
     # Basic Forward Pass Functionality.
     def forward(
         self,
@@ -283,6 +431,9 @@ class SAE(HookedRootModule):
     ) -> torch.Tensor:
         feature_acts = self.encode_fn(x)
         sae_out = self.decode(feature_acts)
+
+        if self.cfg.architecture == "block_diag":
+            raise NotImplementedError
 
         # TEMP
         if self.use_error_term and self.cfg.architecture != "gated":
@@ -602,3 +753,93 @@ def get_activation_fn(
         return TopK(k, postact_fn)
     else:
         raise ValueError(f"Unknown activation function: {activation_fn}")
+
+
+        # # no config changes encoder bias init for now.
+        # self.b_enc = nn.Parameter(
+        #     torch.zeros(self.cfg.d_sae, dtype=self.dtype, device=self.device)
+        # )
+
+        # # methdods which change b_dec as a function of the dataset are implemented after init.
+        # self.b_dec = nn.Parameter(
+        #     torch.zeros(self.cfg.d_in, dtype=self.dtype, device=self.device)
+        # )
+
+        # self.n_blocks = self.cfg.d_in // self.d_head # TODO: how to get number of heads of the model?
+        # self.dec_blocks = {i: nn.Parameter(
+        #     torch.nn.init.kaiming_uniform_(
+        #         torch.empty(
+        #             self.cfg.d_sae // self.n_blocks, self.d_head, dtype=self.dtype, device=self.device
+        #         )
+        #     )
+        # )
+        #     for i in range(self.n_blocks)}
+        
+        # self.enc_blocks = {i: nn.Parameter(
+        #     torch.nn.init.kaiming_uniform_(
+        #         torch.empty(
+        #             self.d_head, self.cfg.d_sae // self.n_blocks, dtype=self.dtype, device=self.device
+        #         )
+        #     )
+        # )
+        #     for i in range(self.n_blocks)}
+
+        # self.W_enc = torch.block_diag(
+        #     *[self.enc_blocks[i] for i in range(self.n_blocks)]
+        # )
+
+        # self.W_dec = torch.block_diag(
+        #     *[self.dec_blocks[i] for i in range(self.n_blocks)]
+        # )
+
+    # def encode_block_diag(self, x):
+    #     n_blocks = self.cfg.n_heads
+    #     n_in = self.cfg.d_in 
+    #     n_latents = self.cfg.d_sae
+    #     outs = []
+
+    #     for i in range(n_blocks):
+    #         # slice x
+    #         start_id = i * n_in // n_blocks
+    #         end_id = (i + 1) * n_in // n_blocks
+    #         input = x[:, start_id:end_id]
+
+    #         # forward pass for sliced x
+    #         pre_relu_latents = self.enc_blocks[str(i)](input)
+    #         latents = self.activation_fn(pre_relu_latents) # (B, n_latents // n_blocks)
+
+    #         # append
+    #         outs.append(latents) # (B, n_latents // n_blocks)
+
+    #     outs = torch.tensor(outs) # (n_blocks, B, n_latents // n_blocks)
+    #     assert outs.ndim == 3, f"outs in encode_block_diag have shape {outs.shape}"
+    #     assert outs.shape[0] == n_blocks, f"outs.shape = {outs.shape}, while n_blocks = {n_blocks}"
+    #     assert outs.shape[-1] == n_latents // n_blocks, f"out.shape = {outs.shape}, while n_blocks = {n_blocks}, n_latents = {n_latents}"
+
+    #     outs = outs.transpose(dim0=0, dim1=1).flatten(start_dim=-2, end_dim=-1) # (B, n_latents) 
+    #     assert outs.ndim == 2, f"outs have shape {outs.shape}"
+    #     assert outs.shape[-1] == n_latents, f"outs have shape {outs.shape}, while n_latents = {n_latents}" 
+        
+    #     # TODO: hacky, the second argument should not be None. It should be related to hidden_pre.
+
+    #     return outs, None 
+
+    # def decode_block_diag(self, feature_acts):
+    #     n_blocks = self.cfg.n_heads
+    #     n_latents = self.cfg.d_sae
+    #     outs = []
+
+    #     for i in range(n_blocks):
+    #         # slice x
+    #         start_id = i * n_latents // n_blocks
+    #         end_id = (i + 1) * n_latents // n_blocks
+    #         input = feature_acts[:, start_id:end_id]
+
+    #         # forward pass for sliced x
+    #         reconst = self.dec_blocks[str(i)](input)
+
+    #         # append
+    #         outs.append(reconst)
+        
+    #     outs = torch.cat(outs, dim=-1)
+    #     return outs
