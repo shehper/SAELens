@@ -380,60 +380,21 @@ class SAE(HookedRootModule):
         sae_out = self.reshape_fn_out(sae_out, self.d_head)  # type: ignore
 
         return sae_out
-
-    def encode_block_diag_old(self, x):
-        n_blocks = self.cfg.n_heads
-        n_in = self.cfg.d_in 
-        outs = []
-
-        for i in range(n_blocks):
-            # slice x
-            start_id = i * n_in // n_blocks
-            end_id = (i + 1) * n_in // n_blocks
-            input = x.index_select(-1, torch.arange(start_id, end_id, device=self.device))
-
-            # forward pass for sliced x
-            pre_relu_latents = self.enc_blocks[str(i)](input)
-            latents = self.activation_fn(pre_relu_latents)
-
-            # append
-            outs.append(latents)
-
-        outs = torch.cat(outs, dim=-1)
-        # TODO: hacky, the second argument should not be None. It should be related to hidden_pre.
-        return outs, None 
-
-    def decode_block_diag_old(self, feature_acts):
-        n_blocks = self.cfg.n_heads
-        n_latents = self.cfg.d_sae
-        outs = []
-
-        for i in range(n_blocks):
-            # slice x
-            start_id = i * n_latents // n_blocks
-            end_id = (i + 1) * n_latents // n_blocks
-            input = feature_acts.index_select(-1, torch.arange(start_id, end_id, device=self.device))
-
-            # forward pass for sliced x
-            reconst = self.dec_blocks[str(i)](input)
-
-            # append
-            outs.append(reconst)
         
-        outs = torch.cat(outs, dim=-1)
-
-        return outs
 
     # Basic Forward Pass Functionality.
     def forward(
         self,
         x: torch.Tensor,
     ) -> torch.Tensor:
+        
+        # TODO: shouldn't be too hard to implement, but haven't had to use it so far.
+        if self.cfg.architecture == "block_diag":
+            raise NotImplementedError
+
         feature_acts = self.encode_fn(x)
         sae_out = self.decode(feature_acts)
 
-        if self.cfg.architecture == "block_diag":
-            raise NotImplementedError
 
         # TEMP
         if self.use_error_term and self.cfg.architecture != "gated":
@@ -753,93 +714,3 @@ def get_activation_fn(
         return TopK(k, postact_fn)
     else:
         raise ValueError(f"Unknown activation function: {activation_fn}")
-
-
-        # # no config changes encoder bias init for now.
-        # self.b_enc = nn.Parameter(
-        #     torch.zeros(self.cfg.d_sae, dtype=self.dtype, device=self.device)
-        # )
-
-        # # methdods which change b_dec as a function of the dataset are implemented after init.
-        # self.b_dec = nn.Parameter(
-        #     torch.zeros(self.cfg.d_in, dtype=self.dtype, device=self.device)
-        # )
-
-        # self.n_blocks = self.cfg.d_in // self.d_head # TODO: how to get number of heads of the model?
-        # self.dec_blocks = {i: nn.Parameter(
-        #     torch.nn.init.kaiming_uniform_(
-        #         torch.empty(
-        #             self.cfg.d_sae // self.n_blocks, self.d_head, dtype=self.dtype, device=self.device
-        #         )
-        #     )
-        # )
-        #     for i in range(self.n_blocks)}
-        
-        # self.enc_blocks = {i: nn.Parameter(
-        #     torch.nn.init.kaiming_uniform_(
-        #         torch.empty(
-        #             self.d_head, self.cfg.d_sae // self.n_blocks, dtype=self.dtype, device=self.device
-        #         )
-        #     )
-        # )
-        #     for i in range(self.n_blocks)}
-
-        # self.W_enc = torch.block_diag(
-        #     *[self.enc_blocks[i] for i in range(self.n_blocks)]
-        # )
-
-        # self.W_dec = torch.block_diag(
-        #     *[self.dec_blocks[i] for i in range(self.n_blocks)]
-        # )
-
-    # def encode_block_diag(self, x):
-    #     n_blocks = self.cfg.n_heads
-    #     n_in = self.cfg.d_in 
-    #     n_latents = self.cfg.d_sae
-    #     outs = []
-
-    #     for i in range(n_blocks):
-    #         # slice x
-    #         start_id = i * n_in // n_blocks
-    #         end_id = (i + 1) * n_in // n_blocks
-    #         input = x[:, start_id:end_id]
-
-    #         # forward pass for sliced x
-    #         pre_relu_latents = self.enc_blocks[str(i)](input)
-    #         latents = self.activation_fn(pre_relu_latents) # (B, n_latents // n_blocks)
-
-    #         # append
-    #         outs.append(latents) # (B, n_latents // n_blocks)
-
-    #     outs = torch.tensor(outs) # (n_blocks, B, n_latents // n_blocks)
-    #     assert outs.ndim == 3, f"outs in encode_block_diag have shape {outs.shape}"
-    #     assert outs.shape[0] == n_blocks, f"outs.shape = {outs.shape}, while n_blocks = {n_blocks}"
-    #     assert outs.shape[-1] == n_latents // n_blocks, f"out.shape = {outs.shape}, while n_blocks = {n_blocks}, n_latents = {n_latents}"
-
-    #     outs = outs.transpose(dim0=0, dim1=1).flatten(start_dim=-2, end_dim=-1) # (B, n_latents) 
-    #     assert outs.ndim == 2, f"outs have shape {outs.shape}"
-    #     assert outs.shape[-1] == n_latents, f"outs have shape {outs.shape}, while n_latents = {n_latents}" 
-        
-    #     # TODO: hacky, the second argument should not be None. It should be related to hidden_pre.
-
-    #     return outs, None 
-
-    # def decode_block_diag(self, feature_acts):
-    #     n_blocks = self.cfg.n_heads
-    #     n_latents = self.cfg.d_sae
-    #     outs = []
-
-    #     for i in range(n_blocks):
-    #         # slice x
-    #         start_id = i * n_latents // n_blocks
-    #         end_id = (i + 1) * n_latents // n_blocks
-    #         input = feature_acts[:, start_id:end_id]
-
-    #         # forward pass for sliced x
-    #         reconst = self.dec_blocks[str(i)](input)
-
-    #         # append
-    #         outs.append(reconst)
-        
-    #     outs = torch.cat(outs, dim=-1)
-    #     return outs
