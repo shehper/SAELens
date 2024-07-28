@@ -151,12 +151,23 @@ class SAETrainer:
 
         pbar = tqdm(total=self.cfg.total_training_tokens, desc="Training SAE")
 
-        self._estimate_norm_scaling_factor_if_needed()
+        # self._estimate_norm_scaling_factor_if_needed()
+
+        self._estimate_per_head_norm_scaling_factor()
+
+        print(f'scaling factors: {self.activation_store.estimated_per_head_norm_scaling_factor}')
 
         # Train loop
         while self.n_training_tokens < self.cfg.total_training_tokens:
             # Do a training step.
             layer_acts = self.activation_store.next_batch()[:, 0, :].to(self.sae.device)
+
+            # print info in the beginning to check that scaling is working well
+            # if self.n_training_tokens < 100000:
+            # reshaped_acts = layer_acts.reshape(-1, 12, 64).clone()
+            # mean_scale = sum([reshaped_acts[:, i].norm(dim=-1).mean().item()**2 for i in range(12)])/12
+            # print(self.n_training_tokens, reshaped_acts.shape, mean_scale)
+
             self.n_training_tokens += self.cfg.train_batch_size_tokens
 
             step_output = self._train_step(sae=self.sae, sae_in=layer_acts)
@@ -190,6 +201,17 @@ class SAETrainer:
             )
         else:
             self.activation_store.estimated_norm_scaling_factor = 1.0
+
+    @torch.no_grad()
+    def _estimate_per_head_norm_scaling_factor(self) -> None:
+        if self.cfg.normalize_activations == "expected_average_only_in":
+            self.activation_store.estimated_per_head_norm_scaling_factor = (
+                self.activation_store.estimate_per_head_norm_scaling_factor()
+            )
+        else:
+            # I don't think I need to set estimated_per_head_norm_scaling_factors
+            # equal to a tensor of 1s here. But maybe do it just for uniformity.
+            pass 
 
     def _train_step(
         self,

@@ -185,6 +185,10 @@ class ActivationsStore:
 
         self.estimated_norm_scaling_factor = 1.0
 
+        n_heads = self.model.cfg.n_heads
+        self.estimated_per_head_norm_scaling_factor = torch.ones((n_heads, 1), 
+                                                                 device=self.device, dtype=self.dtype)
+
         # Check if dataset is tokenized
         dataset_sample = next(iter(self.dataset))
 
@@ -310,6 +314,9 @@ class ActivationsStore:
 
     def apply_norm_scaling_factor(self, activations: torch.Tensor) -> torch.Tensor:
         return activations * self.estimated_norm_scaling_factor
+    
+    def apply_per_head_norm_scaling_factor(self, activations: torch.Tensor) -> torch.Tensor:
+        return activations * self.estimated_per_head_norm_scaling_factor
 
     def unscale(self, activations: torch.Tensor) -> torch.Tensor:
         return activations / self.estimated_norm_scaling_factor
@@ -330,6 +337,34 @@ class ActivationsStore:
         scaling_factor = np.sqrt(self.d_in) / mean_norm
 
         return scaling_factor
+    
+    @torch.no_grad()
+    def estimate_per_head_norm_scaling_factor(self, n_batches_for_norm_estimate: int = int(1e3)):
+        
+        n_heads = self.model.cfg.n_heads 
+        d_head = self.model.cfg.d_head
+        
+        norms_per_head = {i: 0 for i in range(n_heads)}  
+        
+        for _ in tqdm(
+            range(n_batches_for_norm_estimate), desc="Estimating per head norm scaling factors"
+        ):
+            acts = self.next_batch()
+
+            b, t, _ = acts.shape
+            acts = acts.reshape(b, t, n_heads, d_head)
+
+            for head_id in range(n_heads):
+                norms_per_head[head_id] += acts[:, :, head_id].norm(dim=-1).mean().item()
+        
+        for head_id in range(n_heads):
+            norms_per_head[head_id] /= n_batches_for_norm_estimate
+
+        scaling_factors_per_head = torch.tensor([np.sqrt(d_head)/v 
+                                                 for (_, v) in sorted(norms_per_head.items())],
+                                                 device=self.device)[:, None]
+        
+        return scaling_factors_per_head
 
     @property
     def storage_buffer(self) -> torch.Tensor:
@@ -408,7 +443,19 @@ class ActivationsStore:
         elif (
             layerwise_activations[self.hook_name].ndim > 3
         ):  # if we have a head dimension
-            stacked_activations[:, :, 0] = layerwise_activations[self.hook_name].view(
+            # TODO: should I move this to get_activations?
+            if self.normalize_activations == "expected_average_only_in":
+                rescaled_activations = self.apply_per_head_norm_scaling_factor(
+                    activations=layerwise_activations[self.hook_name]
+                )
+            else:
+                rescaled_activations = layerwise_activations[self.hook_name]
+
+            # print(f"scaling factor: {self.estimated_per_head_norm_scaling_factor}")
+            # for i in range(self.model.cfg.n_heads):
+            #     print(f"{i}: shape: {rescaled_activations[:, :, i].shape}, scale: {rescaled_activations[:, :, i].norm(dim=-1).mean()**2:.4f}", flush=True)
+            
+            stacked_activations[:, :, 0] = rescaled_activations.view(
                 n_batches, n_context, -1
             )
         else:
@@ -512,8 +559,8 @@ class ActivationsStore:
         new_buffer = new_buffer[torch.randperm(new_buffer.shape[0])]
 
         # every buffer should be normalized:
-        if self.normalize_activations == "expected_average_only_in":
-            new_buffer = self.apply_norm_scaling_factor(new_buffer)
+        # if self.normalize_activations == "expected_average_only_in":
+        #     new_buffer = self.apply_norm_scaling_factor(new_buffer)
 
         return new_buffer
 
