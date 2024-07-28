@@ -60,13 +60,16 @@ def run_evals(
     if hook_head_index is not None:
         original_act = cache[hook_name][:, :, hook_head_index]
     elif any(substring in hook_name for substring in has_head_dim_key_substrings):
-        original_act = cache[hook_name].flatten(-2, -1)
+        original_act = cache[hook_name]
+        if activation_store.normalize_activations == "expected_average_only_in":
+            original_act = activation_store.apply_per_head_norm_scaling_factor(original_act)
+        original_act = original_act.flatten(-2, -1)
     else:
         original_act = cache[hook_name]
 
     # normalise if necessary (necessary in training only, otherwise we should fold the scaling in)
-    if activation_store.normalize_activations == "expected_average_only_in":
-        original_act = activation_store.apply_norm_scaling_factor(original_act)
+    # if activation_store.normalize_activations == "expected_average_only_in":
+    #     original_act = activation_store.apply_norm_scaling_factor(original_act)
 
     # send the (maybe normalised) activations into the SAE
     if sae.cfg.architecture == "block_diag":
@@ -80,7 +83,11 @@ def run_evals(
         )
 
     if activation_store.normalize_activations == "expected_average_only_in":
-        sae_out = activation_store.unscale(sae_out)
+        # sae_out = activation_store.unscale(sae_out)
+        all_but_last_dim = sae_out.size()[:-1]
+        sae_out = sae_out.reshape(*all_but_last_dim, 12, 64)
+        sae_out = activation_store.unscale_per_head_norm_scaling_factor(sae_out)
+        sae_out = sae_out.flatten(start_dim=-2, end_dim=-1)
 
     del cache
 

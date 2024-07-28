@@ -317,6 +317,9 @@ class ActivationsStore:
     
     def apply_per_head_norm_scaling_factor(self, activations: torch.Tensor) -> torch.Tensor:
         return activations * self.estimated_per_head_norm_scaling_factor
+    
+    def unscale_per_head_norm_scaling_factor(self, activations: torch.Tensor) -> torch.Tensor:
+        return activations / self.estimated_per_head_norm_scaling_factor
 
     def unscale(self, activations: torch.Tensor) -> torch.Tensor:
         return activations / self.estimated_norm_scaling_factor
