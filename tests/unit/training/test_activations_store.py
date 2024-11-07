@@ -1,5 +1,6 @@
 from collections.abc import Iterable
 from math import ceil
+from typing import Optional
 
 import numpy as np
 import pytest
@@ -7,8 +8,12 @@ import torch
 from datasets import Dataset, IterableDataset
 from transformer_lens import HookedTransformer
 
-from sae_lens.config import LanguageModelSAERunnerConfig
-from sae_lens.training.activations_store import ActivationsStore
+from sae_lens.config import LanguageModelSAERunnerConfig, PretokenizeRunnerConfig
+from sae_lens.pretokenize_runner import pretokenize_dataset
+from sae_lens.training.activations_store import (
+    ActivationsStore,
+    validate_pretokenized_dataset_tokenizer,
+)
 from tests.unit.helpers import build_sae_cfg, load_model_cached
 
 
@@ -24,48 +29,40 @@ def tokenize_with_bos(model: HookedTransformer, text: str) -> list[int]:
         {
             "model_name": "tiny-stories-1M",
             "dataset_path": "roneneldan/TinyStories",
-            "tokenized": False,
             "hook_name": "blocks.1.hook_resid_pre",
             "hook_layer": 1,
             "d_in": 64,
-            "prepend_bos": True,
             "normalize_activations": "expected_average_only_in",
         },
         {
             "model_name": "tiny-stories-1M",
             "dataset_path": "roneneldan/TinyStories",
-            "tokenized": False,
             "hook_name": "blocks.1.attn.hook_z",
             "hook_layer": 1,
             "d_in": 64,
-            "prepend_bos": True,
         },
         {
             "model_name": "gelu-2l",
             "dataset_path": "NeelNanda/c4-tokenized-2b",
-            "tokenized": True,
             "hook_name": "blocks.1.hook_resid_pre",
             "hook_layer": 1,
             "d_in": 512,
-            "prepend_bos": True,
+            "context_size": 1024,
         },
         {
             "model_name": "gpt2",
-            "dataset_path": "apollo-research/sae-monology-pile-uncopyrighted-tokenizer-gpt2",
-            "tokenized": True,
+            "dataset_path": "apollo-research/Skylion007-openwebtext-tokenizer-gpt2",
             "hook_name": "blocks.1.hook_resid_pre",
             "hook_layer": 1,
             "d_in": 768,
-            "prepend_bos": True,
+            "context_size": 1024,
         },
         {
             "model_name": "gpt2",
             "dataset_path": "Skylion007/openwebtext",
-            "tokenized": False,
             "hook_name": "blocks.1.hook_resid_pre",
             "hook_layer": 1,
             "d_in": 768,
-            "prepend_bos": True,
         },
     ],
     ids=[
@@ -109,7 +106,7 @@ def test_activations_store__shapes_look_correct_with_real_models_and_datasets(
     assert store.model == model
 
     assert isinstance(store.dataset, IterableDataset)
-    assert isinstance(store.iterable_dataset, Iterable)
+    assert isinstance(store.iterable_sequences, Iterable)
 
     # the rest is in the dataloader.
     expected_size = (
@@ -201,7 +198,9 @@ def test_activations_store__get_batch_tokens__fills_the_context_separated_by_bos
         context_size=context_size,
     )
 
-    activation_store = ActivationsStore.from_config(ts_model, cfg, dataset=dataset)
+    activation_store = ActivationsStore.from_config(
+        ts_model, cfg, override_dataset=dataset
+    )
     encoded_text = tokenize_with_bos(ts_model, "hello world")
     tokens = activation_store.get_batch_tokens()
     assert tokens.shape == (2, context_size)  # batch_size x context_size
@@ -216,9 +215,11 @@ def test_activations_store__get_batch_tokens__fills_the_context_separated_by_bos
     assert tokens[1].tolist() == expected_tokens2
 
 
-def test_activations_store__get_next_dataset_tokens__tokenizes_each_example_in_order(
+def test_activations_store__iterate_raw_dataset_tokens__tokenizes_each_example_in_order(
     ts_model: HookedTransformer,
 ):
+    tokenizer = ts_model.tokenizer
+    assert tokenizer is not None
     cfg = build_sae_cfg()
     dataset = Dataset.from_list(
         [
@@ -227,20 +228,17 @@ def test_activations_store__get_next_dataset_tokens__tokenizes_each_example_in_o
             {"text": "hello world3"},
         ]
     )
-    activation_store = ActivationsStore.from_config(ts_model, cfg, dataset=dataset)
+    activation_store = ActivationsStore.from_config(
+        ts_model, cfg, override_dataset=dataset
+    )
+    iterator = activation_store._iterate_raw_dataset_tokens()
 
-    assert activation_store._get_next_dataset_tokens().tolist() == tokenize_with_bos(
-        ts_model, "hello world1"
-    )
-    assert activation_store._get_next_dataset_tokens().tolist() == tokenize_with_bos(
-        ts_model, "hello world2"
-    )
-    assert activation_store._get_next_dataset_tokens().tolist() == tokenize_with_bos(
-        ts_model, "hello world3"
-    )
+    assert next(iterator).tolist() == tokenizer.encode("hello world1")
+    assert next(iterator).tolist() == tokenizer.encode("hello world2")
+    assert next(iterator).tolist() == tokenizer.encode("hello world3")
 
 
-def test_activations_store__get_next_dataset_tokens__can_handle_long_examples(
+def test_activations_store__iterate_raw_dataset_tokens__can_handle_long_examples(
     ts_model: HookedTransformer,
 ):
     cfg = build_sae_cfg()
@@ -249,9 +247,12 @@ def test_activations_store__get_next_dataset_tokens__can_handle_long_examples(
             {"text": " France" * 3000},
         ]
     )
-    activation_store = ActivationsStore.from_config(ts_model, cfg, dataset=dataset)
+    activation_store = ActivationsStore.from_config(
+        ts_model, cfg, override_dataset=dataset
+    )
+    iterator = activation_store._iterate_raw_dataset_tokens()
 
-    assert len(activation_store._get_next_dataset_tokens().tolist()) == 3001
+    assert len(next(iterator).tolist()) == 3000
 
 
 def test_activations_store_goes_to_cpu(ts_model: HookedTransformer):
@@ -296,3 +297,213 @@ def test_activations_store_estimate_norm_scaling_factor(
 
     scaled_norm = store._storage_buffer.norm(dim=-1).mean() * factor  # type: ignore
     assert scaled_norm == pytest.approx(np.sqrt(store.d_in), abs=5)
+
+
+def test_activations_store___iterate_tokenized_sequences__yields_concat_and_batched_sequences(
+    ts_model: HookedTransformer,
+):
+    tokenizer = ts_model.tokenizer
+    assert tokenizer is not None
+    cfg = build_sae_cfg(prepend_bos=True, context_size=5)
+    dataset = Dataset.from_list(
+        [
+            {"text": "hello world1"},
+            {"text": "hello world2"},
+            {"text": "hello world3"},
+        ]
+    )
+    activation_store = ActivationsStore.from_config(
+        ts_model, cfg, override_dataset=dataset
+    )
+    iterator = activation_store._iterate_tokenized_sequences()
+
+    expected = [
+        tokenizer.bos_token_id,
+        *tokenizer.encode("hello world1"),
+        tokenizer.bos_token_id,
+        *tokenizer.encode("hello world2"),
+        tokenizer.bos_token_id,
+        *tokenizer.encode("hello world3"),
+    ]
+    assert next(iterator).tolist() == expected[:5]
+
+
+def test_activations_store___iterate_tokenized_sequences__yields_sequences_of_context_size(
+    ts_model: HookedTransformer,
+):
+    tokenizer = ts_model.tokenizer
+    assert tokenizer is not None
+    cfg = build_sae_cfg(prepend_bos=True, context_size=5)
+    dataset = Dataset.from_list(
+        [
+            {"text": "hello world1"},
+            {"text": "hello world2"},
+            {"text": "hello world3"},
+        ]
+        * 20
+    )
+    activation_store = ActivationsStore.from_config(
+        ts_model, cfg, override_dataset=dataset
+    )
+    for toks in activation_store._iterate_tokenized_sequences():
+        assert toks.shape == (5,)
+
+
+# We expect the code to work for context_size being less than or equal to the
+# length of the dataset
+@pytest.mark.parametrize(
+    "context_size, expected_error",
+    [(5, RuntimeWarning), (10, None), (15, ValueError)],
+)
+def test_activations_store__errors_on_context_size_mismatch(
+    ts_model: HookedTransformer, context_size: int, expected_error: Optional[ValueError]
+):
+    tokenizer = ts_model.tokenizer
+    assert tokenizer is not None
+    cfg = build_sae_cfg(prepend_bos=True, context_size=context_size)
+    dataset = Dataset.from_list(
+        [
+            {"text": "hello world1"},
+            {"text": "hello world2"},
+            {"text": "hello world3"},
+        ]
+        * 20
+    )
+    pretokenize_cfg = PretokenizeRunnerConfig(context_size=10)
+    tokenized_dataset = pretokenize_dataset(dataset, tokenizer, cfg=pretokenize_cfg)
+
+    # This context_size should raise an error or a warning if it mismatches the dataset size
+    if expected_error is ValueError:
+        with pytest.raises(expected_error):
+            ActivationsStore.from_config(
+                ts_model, cfg, override_dataset=tokenized_dataset
+            )
+    elif expected_error is RuntimeWarning:
+        # If the context_size is smaller than the dataset size we should output a RuntimeWarning
+        with pytest.warns(expected_error):
+            ActivationsStore.from_config(
+                ts_model, cfg, override_dataset=tokenized_dataset
+            )
+    else:
+        # If the context_size is equal to the dataset size the function should pass
+        ActivationsStore.from_config(ts_model, cfg, override_dataset=tokenized_dataset)
+
+
+def test_activations_store__errors_on_negative_context_size():
+    with pytest.raises(ValueError):
+        # We should raise an error when the context_size is negative
+        build_sae_cfg(prepend_bos=True, context_size=-1)
+
+
+def test_activations_store___iterate_tokenized_sequences__yields_identical_results_with_and_without_pretokenizing(
+    ts_model: HookedTransformer,
+):
+    tokenizer = ts_model.tokenizer
+    assert tokenizer is not None
+    cfg = build_sae_cfg(prepend_bos=True, context_size=5)
+    dataset = Dataset.from_list(
+        [
+            {"text": "hello world1"},
+            {"text": "hello world2"},
+            {"text": "hello world3"},
+        ]
+        * 20
+    )
+    pretokenize_cfg = PretokenizeRunnerConfig(
+        context_size=5,
+        num_proc=1,
+        shuffle=False,
+        begin_batch_token="bos",
+        sequence_separator_token="bos",
+    )
+    tokenized_dataset = pretokenize_dataset(dataset, tokenizer, cfg=pretokenize_cfg)
+    activation_store = ActivationsStore.from_config(
+        ts_model, cfg, override_dataset=dataset
+    )
+    tokenized_activation_store = ActivationsStore.from_config(
+        ts_model, cfg, override_dataset=tokenized_dataset
+    )
+    seqs = [seq.tolist() for seq in activation_store._iterate_tokenized_sequences()]
+    pretok_seqs = [
+        seq.tolist()
+        for seq in tokenized_activation_store._iterate_tokenized_sequences()
+    ]
+    assert seqs == pretok_seqs
+
+
+def test_activation_store__errors_if_neither_dataset_nor_dataset_path(
+    ts_model: HookedTransformer,
+):
+    cfg = build_sae_cfg(dataset_path="")
+
+    example_ds = Dataset.from_list(
+        [
+            {"text": "hello world1"},
+            {"text": "hello world2"},
+            {"text": "hello world3"},
+        ]
+        * 20
+    )
+
+    ActivationsStore.from_config(ts_model, cfg, override_dataset=example_ds)
+
+    with pytest.raises(ValueError):
+        ActivationsStore.from_config(ts_model, cfg, override_dataset=None)
+
+
+def test_validate_pretokenized_dataset_tokenizer_errors_if_the_tokenizer_doesnt_match_the_model():
+    ds_path = "chanind/openwebtext-gpt2"
+    model_tokenizer = HookedTransformer.from_pretrained("opt-125m").tokenizer
+    assert model_tokenizer is not None
+    with pytest.raises(ValueError):
+        validate_pretokenized_dataset_tokenizer(ds_path, model_tokenizer)
+
+
+def test_validate_pretokenized_dataset_tokenizer_runs_successfully_if_tokenizers_match(
+    ts_model: HookedTransformer,
+):
+    ds_path = "chanind/openwebtext-gpt2"
+    model_tokenizer = ts_model.tokenizer
+    assert model_tokenizer is not None
+    validate_pretokenized_dataset_tokenizer(ds_path, model_tokenizer)
+
+
+def test_validate_pretokenized_dataset_tokenizer_does_nothing_if_the_dataset_is_not_created_by_sae_lens(
+    ts_model: HookedTransformer,
+):
+    ds_path = "apollo-research/monology-pile-uncopyrighted-tokenizer-gpt2"
+    model_tokenizer = ts_model.tokenizer
+    assert model_tokenizer is not None
+    validate_pretokenized_dataset_tokenizer(ds_path, model_tokenizer)
+
+
+def test_validate_pretokenized_dataset_tokenizer_does_nothing_if_the_dataset_path_doesnt_exist(
+    ts_model: HookedTransformer,
+):
+    ds_path = "blah/nonsense-1234"
+    model_tokenizer = ts_model.tokenizer
+    assert model_tokenizer is not None
+    validate_pretokenized_dataset_tokenizer(ds_path, model_tokenizer)
+
+
+def test_activations_store_respects_position_offsets(ts_model: HookedTransformer):
+    cfg = build_sae_cfg(
+        context_size=10,
+        seqpos_slice=(2, 8),  # Only consider positions 2 to 7 (inclusive)
+    )
+    dataset = Dataset.from_list(
+        [
+            {"text": "This is a test sentence for slicing."},
+        ]
+        * 100
+    )
+
+    activation_store = ActivationsStore.from_config(
+        ts_model, cfg, override_dataset=dataset
+    )
+
+    batch = activation_store.get_batch_tokens(1)
+    activations = activation_store.get_activations(batch)
+
+    assert batch.shape == (1, 10)  # Full context size
+    assert activations.shape == (1, 6, 1, cfg.d_in)  # Only 6 positions (2 to 7)

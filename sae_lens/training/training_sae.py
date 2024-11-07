@@ -2,20 +2,89 @@
 https://github.com/ArthurConmy/sae/blob/main/sae/model.py
 """
 
+import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from typing import Any, Optional
 
 import einops
+import numpy as np
 import torch
 from jaxtyping import Float
+from safetensors.torch import save_file
 from torch import nn
 
 from sae_lens.config import LanguageModelSAERunnerConfig
 from sae_lens.sae import SAE, SAEConfig
 from sae_lens.toolkit.pretrained_sae_loaders import (
-    load_pretrained_sae_lens_sae_components,
+    handle_config_defaulting,
+    read_sae_from_disk,
 )
+
+SPARSITY_PATH = "sparsity.safetensors"
+SAE_WEIGHTS_PATH = "sae_weights.safetensors"
+SAE_CFG_PATH = "cfg.json"
+
+
+def rectangle(x: torch.Tensor) -> torch.Tensor:
+    return ((x > -0.5) & (x < 0.5)).to(x)
+
+
+class Step(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        x: torch.Tensor, threshold: torch.Tensor, bandwidth: float
+    ) -> torch.Tensor:
+        return (x > threshold).to(x)
+
+    @staticmethod
+    def setup_context(
+        ctx: Any, inputs: tuple[torch.Tensor, torch.Tensor, float], output: torch.Tensor
+    ) -> None:
+        x, threshold, bandwidth = inputs
+        del output
+        ctx.save_for_backward(x, threshold)
+        ctx.bandwidth = bandwidth
+
+    @staticmethod
+    def backward(ctx: Any, grad_output: torch.Tensor) -> tuple[None, torch.Tensor, None]:  # type: ignore[override]
+        x, threshold = ctx.saved_tensors
+        bandwidth = ctx.bandwidth
+        threshold_grad = torch.sum(
+            -(1.0 / bandwidth) * rectangle((x - threshold) / bandwidth) * grad_output,
+            dim=0,
+        )
+        return None, threshold_grad, None
+
+
+class JumpReLU(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        x: torch.Tensor, threshold: torch.Tensor, bandwidth: float
+    ) -> torch.Tensor:
+        return (x * (x > threshold)).to(x)
+
+    @staticmethod
+    def setup_context(
+        ctx: Any, inputs: tuple[torch.Tensor, torch.Tensor, float], output: torch.Tensor
+    ) -> None:
+        x, threshold, bandwidth = inputs
+        del output
+        ctx.save_for_backward(x, threshold)
+        ctx.bandwidth = bandwidth
+
+    @staticmethod
+    def backward(ctx: Any, grad_output: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, None]:  # type: ignore[override]
+        x, threshold = ctx.saved_tensors
+        bandwidth = ctx.bandwidth
+        x_grad = (x > threshold) * grad_output  # We don't apply STE to x input
+        threshold_grad = torch.sum(
+            -(threshold / bandwidth)
+            * rectangle((x - threshold) / bandwidth)
+            * grad_output,
+            dim=0,
+        )
+        return x_grad, threshold_grad, None
 
 
 @dataclass
@@ -27,9 +96,10 @@ class TrainStepOutput:
     mse_loss: float
     l1_loss: float
     ghost_grad_loss: float
+    auxiliary_reconstruction_loss: float = 0.0
 
 
-@dataclass
+@dataclass(kw_only=True)
 class TrainingSAEConfig(SAEConfig):
 
     # Sparsity Loss Calculations
@@ -43,6 +113,8 @@ class TrainingSAEConfig(SAEConfig):
     decoder_heuristic_init: bool = False
     init_encoder_as_decoder_transpose: bool = False
     scale_sparsity_penalty_by_decoder_norm: bool = False
+    jumprelu_init_threshold: float
+    jumprelu_bandwidth: float
 
     @classmethod
     def from_sae_runner_config(
@@ -50,7 +122,8 @@ class TrainingSAEConfig(SAEConfig):
     ) -> "TrainingSAEConfig":
 
         return cls(
-            # base confg
+            # base config
+            architecture=cfg.architecture,
             d_in=cfg.d_in,
             d_sae=cfg.d_sae,  # type: ignore
             dtype=cfg.dtype,
@@ -60,12 +133,14 @@ class TrainingSAEConfig(SAEConfig):
             hook_layer=cfg.hook_layer,
             hook_head_index=cfg.hook_head_index,
             activation_fn_str=cfg.activation_fn,
+            activation_fn_kwargs=cfg.activation_fn_kwargs,
             apply_b_dec_to_input=cfg.apply_b_dec_to_input,
             finetuning_scaling_factor=cfg.finetuning_method is not None,
             sae_lens_training_version=cfg.sae_lens_training_version,
             context_size=cfg.context_size,
             dataset_path=cfg.dataset_path,
             prepend_bos=cfg.prepend_bos,
+            seqpos_slice=cfg.seqpos_slice,
             # Training cfg
             l1_coefficient=cfg.l1_coefficient,
             lp_norm=cfg.lp_norm,
@@ -78,11 +153,33 @@ class TrainingSAEConfig(SAEConfig):
             init_encoder_as_decoder_transpose=cfg.init_encoder_as_decoder_transpose,
             scale_sparsity_penalty_by_decoder_norm=cfg.scale_sparsity_penalty_by_decoder_norm,
             normalize_activations=cfg.normalize_activations,
+            dataset_trust_remote_code=cfg.dataset_trust_remote_code,
+            model_from_pretrained_kwargs=cfg.model_from_pretrained_kwargs,
+            jumprelu_init_threshold=cfg.jumprelu_init_threshold,
+            jumprelu_bandwidth=cfg.jumprelu_bandwidth,
         )
 
     @classmethod
     def from_dict(cls, config_dict: dict[str, Any]) -> "TrainingSAEConfig":
-        return TrainingSAEConfig(**config_dict)
+        # remove any keys that are not in the dataclass
+        # since we sometimes enhance the config with the whole LM runner config
+        valid_field_names = {field.name for field in fields(cls)}
+        valid_config_dict = {
+            key: val for key, val in config_dict.items() if key in valid_field_names
+        }
+
+        # ensure seqpos slice is tuple
+        # ensure that seqpos slices is a tuple
+        # Ensure seqpos_slice is a tuple
+        if "seqpos_slice" in valid_config_dict:
+            if isinstance(valid_config_dict["seqpos_slice"], list):
+                valid_config_dict["seqpos_slice"] = tuple(
+                    valid_config_dict["seqpos_slice"]
+                )
+            elif not isinstance(valid_config_dict["seqpos_slice"], tuple):
+                valid_config_dict["seqpos_slice"] = (valid_config_dict["seqpos_slice"],)
+
+        return TrainingSAEConfig(**valid_config_dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -104,9 +201,11 @@ class TrainingSAEConfig(SAEConfig):
     # parameters. Maybe there's a cleaner way to do this
     def get_base_sae_cfg_dict(self) -> dict[str, Any]:
         return {
+            "architecture": self.architecture,
             "d_in": self.d_in,
             "d_sae": self.d_sae,
             "activation_fn_str": self.activation_fn_str,
+            "activation_fn_kwargs": self.activation_fn_kwargs,
             "apply_b_dec_to_input": self.apply_b_dec_to_input,
             "dtype": self.dtype,
             "model_name": self.model_name,
@@ -140,6 +239,23 @@ class TrainingSAE(SAE):
         base_sae_cfg = SAEConfig.from_dict(cfg.get_base_sae_cfg_dict())
         super().__init__(base_sae_cfg)
         self.cfg = cfg  # type: ignore
+
+        if cfg.architecture == "standard":
+            self.encode_with_hidden_pre_fn = self.encode_with_hidden_pre
+        elif cfg.architecture == "gated":
+            self.encode_with_hidden_pre_fn = self.encode_with_hidden_pre_gated
+        elif cfg.architecture == "jumprelu":
+            self.encode_with_hidden_pre_fn = self.encode_with_hidden_pre_jumprelu
+            self.log_threshold = nn.Parameter(
+                torch.ones(cfg.d_sae, dtype=self.dtype, device=self.device)
+                * np.log(cfg.jumprelu_init_threshold)
+            )
+            self.bandwidth = cfg.jumprelu_bandwidth
+        else:
+            raise ValueError(f"Unknown architecture: {cfg.architecture}")
+
+        self.check_cfg_compatibility()
+
         self.use_error_term = use_error_term
 
         self.initialize_weights_complex()
@@ -154,30 +270,44 @@ class TrainingSAE(SAE):
     def from_dict(cls, config_dict: dict[str, Any]) -> "TrainingSAE":
         return cls(TrainingSAEConfig.from_dict(config_dict))
 
-    def encode(
+    def check_cfg_compatibility(self):
+        if self.cfg.architecture == "gated":
+            assert (
+                self.cfg.use_ghost_grads is False
+            ), "Gated SAEs do not support ghost grads"
+            assert self.use_error_term is False, "Gated SAEs do not support error terms"
+
+    def encode_standard(
         self, x: Float[torch.Tensor, "... d_in"]
     ) -> Float[torch.Tensor, "... d_sae"]:
         """
         Calcuate SAE features from inputs
         """
-        feature_acts, _ = self.encode_with_hidden_pre(x)
+        feature_acts, _ = self.encode_with_hidden_pre_fn(x)
         return feature_acts
+
+    def encode_with_hidden_pre_jumprelu(
+        self, x: Float[torch.Tensor, "... d_in"]
+    ) -> tuple[Float[torch.Tensor, "... d_sae"], Float[torch.Tensor, "... d_sae"]]:
+        sae_in = self.process_sae_in(x)
+
+        hidden_pre = sae_in @ self.W_enc + self.b_enc
+
+        if self.training:
+            hidden_pre = (
+                hidden_pre + torch.randn_like(hidden_pre) * self.cfg.noise_scale
+            )
+
+        threshold = torch.exp(self.log_threshold)
+
+        feature_acts = JumpReLU.apply(hidden_pre, threshold, self.bandwidth)
+
+        return feature_acts, hidden_pre  # type: ignore
 
     def encode_with_hidden_pre(
         self, x: Float[torch.Tensor, "... d_in"]
     ) -> tuple[Float[torch.Tensor, "... d_sae"], Float[torch.Tensor, "... d_sae"]]:
-
-        # move x to correct dtype
-        x = x.to(self.dtype)
-
-        # handle hook z reshaping if needed.
-        x = self.reshape_fn_in(x)  # type: ignore
-
-        # apply b_dec_to_input if using that method.
-        sae_in = self.hook_sae_input(x - (self.b_dec * self.cfg.apply_b_dec_to_input))
-
-        # handle run time activation normalization if needed
-        x = self.run_time_activation_norm_fn_in(x)
+        sae_in = self.process_sae_in(x)
 
         # "... d_in, d_in d_sae -> ... d_sae",
         hidden_pre = self.hook_sae_acts_pre(sae_in @ self.W_enc + self.b_enc)
@@ -188,12 +318,39 @@ class TrainingSAE(SAE):
 
         return feature_acts, hidden_pre_noised
 
+    def encode_with_hidden_pre_gated(
+        self, x: Float[torch.Tensor, "... d_in"]
+    ) -> tuple[Float[torch.Tensor, "... d_sae"], Float[torch.Tensor, "... d_sae"]]:
+        sae_in = self.process_sae_in(x)
+
+        # apply b_dec_to_input if using that method.
+        sae_in = x - (self.b_dec * self.cfg.apply_b_dec_to_input)
+
+        # Gating path with Heaviside step function
+        gating_pre_activation = sae_in @ self.W_enc + self.b_gate
+        active_features = (gating_pre_activation > 0).to(self.dtype)
+
+        # Magnitude path with weight sharing
+        magnitude_pre_activation = sae_in @ (self.W_enc * self.r_mag.exp()) + self.b_mag
+        # magnitude_pre_activation_noised = magnitude_pre_activation + (
+        #     torch.randn_like(magnitude_pre_activation) * self.cfg.noise_scale * self.training
+        # )
+        feature_magnitudes = self.activation_fn(
+            magnitude_pre_activation
+        )  # magnitude_pre_activation_noised)
+
+        # Return both the gated feature activations and the magnitude pre-activations
+        return (
+            active_features * feature_magnitudes,
+            magnitude_pre_activation,
+        )  # magnitude_pre_activation_noised
+
     def forward(
         self,
         x: Float[torch.Tensor, "... d_in"],
     ) -> Float[torch.Tensor, "... d_in"]:
 
-        feature_acts, _ = self.encode_with_hidden_pre(x)
+        feature_acts, _ = self.encode_with_hidden_pre_fn(x)
         sae_out = self.decode(feature_acts)
 
         return sae_out
@@ -207,39 +364,68 @@ class TrainingSAE(SAE):
 
         # do a forward pass to get SAE out, but we also need the
         # hidden pre.
-        feature_acts, _ = self.encode_with_hidden_pre(sae_in)
+        feature_acts, hidden_pre = self.encode_with_hidden_pre_fn(sae_in)
         sae_out = self.decode(feature_acts)
 
         # MSE LOSS
         per_item_mse_loss = self.mse_loss_fn(sae_out, sae_in)
         mse_loss = per_item_mse_loss.sum(dim=-1).mean()
 
-        # GHOST GRADS
-        if self.cfg.use_ghost_grads and self.training and dead_neuron_mask is not None:
+        l1_loss = torch.tensor(0.0, device=sae_in.device)
+        aux_reconstruction_loss = torch.tensor(0.0, device=sae_in.device)
+        ghost_grad_loss = torch.tensor(0.0, device=sae_in.device)
 
-            # first half of second forward pass
-            _, hidden_pre = self.encode_with_hidden_pre(sae_in)
-            ghost_grad_loss = self.calculate_ghost_grad_loss(
-                x=sae_in,
-                sae_out=sae_out,
-                per_item_mse_loss=per_item_mse_loss,
-                hidden_pre=hidden_pre,
-                dead_neuron_mask=dead_neuron_mask,
+        if self.cfg.architecture == "gated":
+            # Gated SAE Loss Calculation
+
+            # Shared variables
+            sae_in_centered = (
+                self.reshape_fn_in(sae_in) - self.b_dec * self.cfg.apply_b_dec_to_input
             )
+            pi_gate = sae_in_centered @ self.W_enc + self.b_gate
+            pi_gate_act = torch.relu(pi_gate)
+
+            # SFN sparsity loss - summed over the feature dimension and averaged over the batch
+            l1_loss = (
+                current_l1_coefficient
+                * torch.sum(pi_gate_act * self.W_dec.norm(dim=1), dim=-1).mean()
+            )
+
+            # Auxiliary reconstruction loss - summed over the feature dimension and averaged over the batch
+            via_gate_reconstruction = pi_gate_act @ self.W_dec + self.b_dec
+            aux_reconstruction_loss = torch.sum(
+                (via_gate_reconstruction - sae_in) ** 2, dim=-1
+            ).mean()
+
+            loss = mse_loss + l1_loss + aux_reconstruction_loss
+        elif self.cfg.architecture == "jumprelu":
+            threshold = torch.exp(self.log_threshold)
+            l0 = torch.sum(Step.apply(hidden_pre, threshold, self.bandwidth), dim=-1)  # type: ignore
+            l1_loss = (current_l1_coefficient * l0).mean()
+            loss = mse_loss + l1_loss
         else:
-            ghost_grad_loss = 0.0
+            # default SAE sparsity loss
+            weighted_feature_acts = feature_acts * self.W_dec.norm(dim=1)
+            sparsity = weighted_feature_acts.norm(
+                p=self.cfg.lp_norm, dim=-1
+            )  # sum over the feature dimension
 
-        # SPARSITY LOSS
-        # either the W_dec norms are 1 and this won't do anything or they are not 1
-        # and we're using their norm in the loss function.
-        weighted_feature_acts = feature_acts * self.W_dec.norm(dim=1)
-        sparsity = weighted_feature_acts.norm(
-            p=self.cfg.lp_norm, dim=-1
-        )  # sum over the feature dimension
+            l1_loss = (current_l1_coefficient * sparsity).mean()
+            loss = mse_loss + l1_loss + ghost_grad_loss
 
-        l1_loss = (current_l1_coefficient * sparsity).mean()
-
-        loss = mse_loss + l1_loss + ghost_grad_loss
+            if (
+                self.cfg.use_ghost_grads
+                and self.training
+                and dead_neuron_mask is not None
+            ):
+                ghost_grad_loss = self.calculate_ghost_grad_loss(
+                    x=sae_in,
+                    sae_out=sae_out,
+                    per_item_mse_loss=per_item_mse_loss,
+                    hidden_pre=hidden_pre,
+                    dead_neuron_mask=dead_neuron_mask,
+                )
+            loss = loss + ghost_grad_loss
 
         return TrainStepOutput(
             sae_in=sae_in,
@@ -253,6 +439,7 @@ class TrainingSAE(SAE):
                 if isinstance(ghost_grad_loss, torch.Tensor)
                 else ghost_grad_loss
             ),
+            auxiliary_reconstruction_loss=aux_reconstruction_loss.item(),
         )
 
     def calculate_ghost_grad_loss(
@@ -315,21 +502,51 @@ class TrainingSAE(SAE):
         else:
             return standard_mse_loss_fn
 
+    def save_model(self, path: str, sparsity: Optional[torch.Tensor] = None):
+        if not os.path.exists(path):
+            os.mkdir(path)
+
+        state_dict = self.state_dict().copy()
+
+        if self.cfg.architecture == "jumprelu":
+            threshold = torch.exp(self.log_threshold).detach()
+            del state_dict["log_threshold"]
+            state_dict["threshold"] = threshold
+
+        save_file(state_dict, f"{path}/{SAE_WEIGHTS_PATH}")
+
+        # Save the config
+        config = self.cfg.to_dict()
+        with open(f"{path}/{SAE_CFG_PATH}", "w") as f:
+            json.dump(config, f)
+
+        if sparsity is not None:
+            sparsity_in_dict = {"sparsity": sparsity}
+            save_file(sparsity_in_dict, f"{path}/{SPARSITY_PATH}")
+
     @classmethod
     def load_from_pretrained(
         cls,
         path: str,
         device: str = "cpu",
-        dtype: str = "float32",
+        dtype: str | None = None,
     ) -> "TrainingSAE":
 
-        config_path = os.path.join(path, "cfg.json")
-        weight_path = os.path.join(path, "sae_weights.safetensors")
+        # get the config
+        config_path = os.path.join(path, SAE_CFG_PATH)
+        with open(config_path, "r") as f:
+            cfg_dict = json.load(f)
+        cfg_dict = handle_config_defaulting(cfg_dict)
+        cfg_dict["device"] = device
+        if dtype is not None:
+            cfg_dict["dtype"] = dtype
 
-        cfg_dict, state_dict, _ = load_pretrained_sae_lens_sae_components(
-            config_path, weight_path, device, dtype
+        weight_path = os.path.join(path, SAE_WEIGHTS_PATH)
+        cfg_dict, state_dict = read_sae_from_disk(
+            cfg_dict=cfg_dict,
+            weight_path=weight_path,
+            device=device,
         )
-
         sae_cfg = TrainingSAEConfig.from_dict(cfg_dict)
 
         sae = cls(sae_cfg)
@@ -351,10 +568,7 @@ class TrainingSAE(SAE):
             )
             self.initialize_decoder_norm_constant_norm()
 
-        elif self.cfg.normalize_sae_decoder:
-            self.set_decoder_norm_to_unit_norm()
-
-        # Then we intialize the encoder weights (either as the transpose of decoder or not)
+        # Then we initialize the encoder weights (either as the transpose of decoder or not)
         if self.cfg.init_encoder_as_decoder_transpose:
             self.W_enc.data = self.W_dec.data.T.clone().contiguous()
         else:

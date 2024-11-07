@@ -1,6 +1,10 @@
+import pandas as pd
+import pytest
+
 from sae_lens.toolkit.pretrained_saes_directory import (
     PretrainedSAELookup,
     get_pretrained_saes_directory,
+    get_repo_id_and_folder_name,
 )
 
 
@@ -57,6 +61,81 @@ def test_get_pretrained_saes_directory():
             "blocks.11.hook_resid_pre": 56.0,
             "blocks.11.hook_resid_post": 70.0,
         },
+        config_overrides={
+            "model_from_pretrained_kwargs": {
+                "center_writing_weights": True,
+            }
+        },
+        neuronpedia_id={
+            "blocks.0.hook_resid_pre": "gpt2-small/0-res-jb",
+            "blocks.1.hook_resid_pre": "gpt2-small/1-res-jb",
+            "blocks.2.hook_resid_pre": "gpt2-small/2-res-jb",
+            "blocks.3.hook_resid_pre": "gpt2-small/3-res-jb",
+            "blocks.4.hook_resid_pre": "gpt2-small/4-res-jb",
+            "blocks.5.hook_resid_pre": "gpt2-small/5-res-jb",
+            "blocks.6.hook_resid_pre": "gpt2-small/6-res-jb",
+            "blocks.7.hook_resid_pre": "gpt2-small/7-res-jb",
+            "blocks.8.hook_resid_pre": "gpt2-small/8-res-jb",
+            "blocks.9.hook_resid_pre": "gpt2-small/9-res-jb",
+            "blocks.10.hook_resid_pre": "gpt2-small/10-res-jb",
+            "blocks.11.hook_resid_pre": "gpt2-small/11-res-jb",
+            "blocks.11.hook_resid_post": "gpt2-small/12-res-jb",
+        },
     )
 
     assert sae_directory["gpt2-small-res-jb"] == expected_result
+
+
+def test_get_pretrained_saes_directory_unique_np_ids():
+
+    # ideally this code should be elsewhere but as a stop-gap we'll leave it here.
+    df = pd.DataFrame.from_records(
+        {k: v.__dict__ for k, v in get_pretrained_saes_directory().items()}
+    ).T
+    df.drop(
+        columns=[
+            "repo_id",
+            "saes_map",
+            "expected_var_explained",
+            "expected_l0",
+            "config_overrides",
+            "conversion_func",
+        ],
+        inplace=True,
+    )
+    df["neuronpedia_id_list"] = df["neuronpedia_id"].apply(lambda x: list(x.items()))
+    df_exploded = df.explode("neuronpedia_id_list")
+    df_exploded[["sae_lens_id", "neuronpedia_id"]] = pd.DataFrame(
+        df_exploded["neuronpedia_id_list"].tolist(), index=df_exploded.index
+    )
+    df_exploded = df_exploded.drop(columns=["neuronpedia_id_list"])
+    df_exploded = df_exploded.reset_index(drop=True)
+    df_exploded["neuronpedia_set"] = df_exploded["neuronpedia_id"].apply(
+        lambda x: "-".join(x.split("/")[-1].split("-")[1:]) if x is not None else None
+    )
+
+    duplicate_ids = df_exploded.groupby("neuronpedia_id").sae_lens_id.apply(
+        lambda x: len(x)
+    )
+    assert (
+        duplicate_ids.max() == 1
+    ), f"Duplicate IDs found: {duplicate_ids[duplicate_ids > 1]}"
+
+
+def test_get_repo_id_and_folder_name_release_found():
+    repo_id, folder_name = get_repo_id_and_folder_name(
+        "gpt2-small-res-jb", sae_id="blocks.0.hook_resid_pre"
+    )
+    assert repo_id == "jbloom/GPT2-Small-SAEs-Reformatted"
+    assert folder_name == "blocks.0.hook_resid_pre"
+
+
+def test_get_repo_id_and_folder_name_release_not_found():
+    repo_id, folder_name = get_repo_id_and_folder_name("release1", "sae1")
+    assert repo_id == "release1"
+    assert folder_name == "sae1"
+
+
+def test_get_repo_id_and_folder_name_raises_error_if_sae_id_not_found():
+    with pytest.raises(ValueError):
+        get_repo_id_and_folder_name("gpt2-small-res-jb", sae_id="sae1")

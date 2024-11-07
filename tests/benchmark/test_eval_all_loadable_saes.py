@@ -1,14 +1,26 @@
 # import pandas as pd
 # import plotly.express as px
 # import numpy as np
+import argparse
+import json
+from pathlib import Path
+
 import pytest
 import torch
-from tqdm import tqdm
 
-# from sae_lens.training.evals import run_evals
-from sae_lens.sae import SAE
-from sae_lens.toolkit.pretrained_saes_directory import get_pretrained_saes_directory
-from sae_lens.training.activations_store import ActivationsStore
+from sae_lens import SAE, ActivationsStore
+from sae_lens.analysis.neuronpedia_integration import open_neuronpedia_feature_dashboard
+from sae_lens.evals import (
+    all_loadable_saes,
+    get_eval_everything_config,
+    process_results,
+    run_evals,
+    run_evaluations,
+)
+from sae_lens.toolkit.pretrained_sae_loaders import (
+    SAEConfigLoadOptions,
+    get_sae_config_from_hf,
+)
 from tests.unit.helpers import load_model_cached
 
 # from sae_lens.evals import run_evals
@@ -26,19 +38,14 @@ because they just didn't hold with such nonsense.
 """
 
 
-# @pytest.fixture
-def all_loadable_saes() -> list[tuple[str, str]]:
-    all_loadable_saes = []
-    saes_directory = get_pretrained_saes_directory()
-    for release, lookup in tqdm(saes_directory.items()):
-        for sae_name in lookup.saes_map.keys():
-            expected_var_explained = lookup.expected_var_explained[sae_name]
-            expected_l0 = lookup.expected_l0[sae_name]
-            all_loadable_saes.append(
-                (release, sae_name, expected_var_explained, expected_l0)
-            )
-
-    return all_loadable_saes
+def test_get_sae_config():
+    repo_id = "jbloom/GPT2-Small-SAEs-Reformatted"
+    cfg = get_sae_config_from_hf(
+        repo_id=repo_id,
+        folder_name="blocks.0.hook_resid_pre",
+        options=SAEConfigLoadOptions(),
+    )
+    assert cfg is not None
 
 
 @pytest.mark.parametrize(
@@ -56,6 +63,62 @@ def test_loading_pretrained_saes(
 
     sae, _, _ = SAE.from_pretrained(release, sae_name, device=device)
     assert isinstance(sae, SAE)
+
+
+@pytest.mark.parametrize(
+    "release, sae_name, expected_var_explained, expected_l0", all_loadable_saes()
+)
+def test_loading_pretrained_saes_open_neuronpedia(
+    release: str, sae_name: str, expected_var_explained: float, expected_l0: float
+):
+    if torch.cuda.is_available():
+        device = "cuda"
+    elif torch.backends.mps.is_available():
+        device = "mps"
+    else:
+        device = "cpu"
+
+    sae, _, _ = SAE.from_pretrained(release, sae_name, device=device)
+    assert isinstance(sae, SAE)
+
+    open_neuronpedia_feature_dashboard(sae, 0)
+
+
+@pytest.mark.parametrize(
+    "release, sae_name, expected_var_explained, expected_l0", all_loadable_saes()
+)
+def test_loading_pretrained_saes_do_forward_pass(
+    release: str, sae_name: str, expected_var_explained: float, expected_l0: float
+):
+    if torch.cuda.is_available():
+        device = "cuda"
+    elif torch.backends.mps.is_available():
+        device = "mps"
+    else:
+        device = "cpu"
+
+    sae, _, _ = SAE.from_pretrained(release, sae_name, device=device)
+    assert isinstance(sae, SAE)
+
+    # from transformer_lens import HookedTransformer
+    # model = HookedTransformer.from_pretrained("gemma-2-9b")
+    # sae_in = model.run_with_cache("test test test")[1][sae.cfg.hook_name]
+
+    if "hook_z" in sae.cfg.hook_name:
+        # check that reshaping works as intended
+        from transformer_lens.loading_from_pretrained import get_pretrained_model_config
+
+        model_cfg = get_pretrained_model_config(sae.cfg.model_name)
+        sae_in = torch.randn(1, 4, model_cfg.n_heads, model_cfg.d_head).to(device)
+        sae_out = sae(sae_in)
+        assert sae_out.shape == sae_in.shape
+
+    sae.turn_off_forward_pass_hook_z_reshaping()  # just in case
+    sae_in = torch.randn(1, sae.cfg.d_in).to(device)
+    sae_out = sae(sae_in)
+    assert sae_out.shape == sae_in.shape
+
+    assert True  # If we get here, we're good
 
 
 @pytest.mark.parametrize(
@@ -93,55 +156,65 @@ def test_eval_all_loadable_saes(
         device=device,
     )
 
-    if sae.cfg.normalize_activations == "expected_average_only_in":
-        norm_scaling_factor = activation_store.estimate_norm_scaling_factor(
-            n_batches_for_norm_estimate=100
-        )
-        sae.fold_activation_norm_scaling_factor(norm_scaling_factor)
-        activation_store.normalize_activations = "none"
-
-    metrics = {}
-    # eval_metrics = run_evals(
-    #     sae=sae,
-    #     activation_store=activation_store,
-    #     model=model,
-    #     n_eval_batches=10,
-    #     eval_batch_size_prompts=8,
-    # )  #
-    # eval_metrics = dict(eval_metrics)
-    # eval_metrics["ce_loss_diff"] = (
-    #     eval_metrics["metrics/ce_loss_with_sae"].item()
-    #     - eval_metrics["metrics/ce_loss_without_sae"].item()
-    # )
-    # assert eval_metrics["ce_loss_diff"] < 0.1, "CE Loss Difference is too high"
-
-    # CE Loss Difference
-    _, cache = model.run_with_cache(
-        example_text, names_filter=[sae.cfg.hook_name], prepend_bos=sae.cfg.prepend_bos
+    eval_config = get_eval_everything_config(
+        batch_size_prompts=8,
+        n_eval_reconstruction_batches=3,
+        n_eval_sparsity_variance_batches=100,
     )
 
-    # Use the SAE
-    sae_in = cache[sae.cfg.hook_name].squeeze()[1:]
+    metrics, _ = run_evals(
+        sae=sae,
+        activation_store=activation_store,
+        model=model,
+        eval_config=eval_config,
+        ignore_tokens={
+            model.tokenizer.pad_token_id,  # type: ignore
+            model.tokenizer.eos_token_id,  # type: ignore
+            model.tokenizer.bos_token_id,  # type: ignore
+        },
+    )
 
-    feature_acts = sae.encode(sae_in)
-    sae_out = sae.decode(feature_acts)
+    assert pytest.approx(metrics["l0"], abs=5) == expected_l0
+    assert (
+        pytest.approx(metrics["explained_variance"], abs=0.1) == expected_var_explained
+    )
 
-    mean_l0 = (feature_acts[1:] > 0).float().sum(-1).detach().cpu().numpy().mean()
 
-    # # get the FVE of teh SAE
-    per_token_l2_loss = (sae_out - sae_in).pow(2).sum(dim=-1).squeeze()
-    total_variance = (sae_in - sae_in.mean(0)).pow(2).sum(-1)
-    explained_variance = 1 - per_token_l2_loss / total_variance
+@pytest.fixture
+def mock_evals_simple_args(tmp_path: Path):
+    class Args:
+        sae_regex_pattern = "gpt2-small-res-jb"
+        sae_block_pattern = "blocks.0.hook_resid_pre"
+        num_eval_batches = 1
+        n_eval_reconstruction_batches = 1
+        n_eval_sparsity_variance_batches = 1
 
-    metrics["l0"] = mean_l0
-    metrics["var_explained"] = explained_variance.mean().cpu().item()
+        eval_batch_size_prompts = 2
+        datasets = ["Skylion007/openwebtext"]
+        ctx_lens = [128]
+        output_dir = str(tmp_path)
+        verbose = False
 
-    assert metrics == {
-        "l0": pytest.approx(expected_l0, abs=5),
-        "var_explained": pytest.approx(expected_var_explained, abs=0.1),
-    }
+    return Args()
 
-    # assert mean_l0 == pytest.approx(expected_l0, abs=5)
-    # assert explained_variance.mean().cpu() == pytest.approx(
-    #     expected_var_explained, abs=0.1
-    # )
+
+def test_run_evaluations_process_results(mock_evals_simple_args: argparse.Namespace):
+    """
+    This test is more like an acceptance test for the evals code than a benchmark.
+    """
+    eval_results = run_evaluations(mock_evals_simple_args)
+    output_files = process_results(eval_results, mock_evals_simple_args.output_dir)
+
+    print("Evaluation complete. Output files:")
+    print(f"Individual JSONs: {len(output_files['individual_jsons'])}")  # type: ignore
+    print(f"Combined JSON: {output_files['combined_json']}")
+    print(f"CSV: {output_files['csv']}")
+
+    # open and validate the files
+    combined_json_path = output_files["combined_json"]
+    assert isinstance(combined_json_path, Path)
+    assert combined_json_path.exists()
+    with open(combined_json_path, "r") as f:
+        data = json.load(f)[0]
+        assert "metrics" in data
+        assert "feature_metrics" in data

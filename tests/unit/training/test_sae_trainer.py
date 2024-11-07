@@ -33,7 +33,7 @@ def model():
 @pytest.fixture
 def activation_store(model: HookedTransformer, cfg: LanguageModelSAERunnerConfig):
     return ActivationsStore.from_config(
-        model, cfg, dataset=Dataset.from_list([{"text": "hello world"}] * 2000)
+        model, cfg, override_dataset=Dataset.from_list([{"text": "hello world"}] * 2000)
     )
 
 
@@ -184,7 +184,7 @@ def test_build_train_step_log_dict(trainer: SAETrainer) -> None:
         "losses/mse_loss": 0.25,
         # l1 loss is scaled by l1_coefficient
         "losses/l1_loss": train_output.l1_loss / trainer.cfg.l1_coefficient,
-        "losses/ghost_grad_loss": pytest.approx(0.15),
+        "losses/auxiliary_reconstruction_loss": 0.0,
         "losses/overall_loss": 0.5,
         "metrics/explained_variance": 0.75,
         "metrics/explained_variance_std": 0.25,
@@ -204,13 +204,14 @@ def test_train_sae_group_on_language_model__runs(
     checkpoint_dir = tmp_path / "checkpoint"
     cfg = build_sae_cfg(
         checkpoint_path=str(checkpoint_dir),
-        train_batch_size=32,
         training_tokens=100,
         context_size=8,
     )
     # just a tiny datast which will run quickly
     dataset = Dataset.from_list([{"text": "hello world"}] * 2000)
-    activation_store = ActivationsStore.from_config(ts_model, cfg, dataset=dataset)
+    activation_store = ActivationsStore.from_config(
+        ts_model, cfg, override_dataset=dataset
+    )
     sae = TrainingSAE.from_dict(cfg.get_training_sae_cfg_dict())
     sae = SAETrainer(
         model=ts_model,

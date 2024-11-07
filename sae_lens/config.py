@@ -5,6 +5,7 @@ from typing import Any, Literal, Optional, cast
 
 import torch
 import wandb
+from datasets import Dataset, DatasetDict, IterableDataset, IterableDatasetDict
 
 from sae_lens import __version__
 
@@ -18,6 +19,8 @@ DTYPE_MAP = {
     "torch.float16": torch.float16,
     "torch.bfloat16": torch.bfloat16,
 }
+
+HfDataset = DatasetDict | Dataset | IterableDatasetDict | IterableDataset
 
 
 @dataclass
@@ -57,11 +60,14 @@ class LanguageModelSAERunnerConfig:
         store_batch_size_prompts (int): The batch size for storing activations. This controls how many prompts are in the batch of the language model when generating actiations.
         train_batch_size_tokens (int): The batch size for training. This controls the batch size of the SAE Training loop.
         normalize_activations (str): Activation Normalization Strategy. Either none, expected_average_only_in (estimate the average activation norm and divide activations by it -> this can be folded post training and set to None), or constant_norm_rescale (at runtime set activation norm to sqrt(d_in) and then scale up the SAE output).
+        seqpos_slice (tuple): Determines slicing of activations when constructing batches during training. The slice should be (start_pos, end_pos, optional[step_size]), e.g. for Othello we sometimes use (5, -5). Note, step_size > 0.
         device (str): The device to use. Usually cuda.
         act_store_device (str): The device to use for the activation store. CPU is advised in order to save vram.
         seed (int): The seed to use.
         dtype (str): The data type to use.
         prepend_bos (bool): Whether to prepend the beginning of sequence token. You should use whatever the model was trained with.
+        jumprelu_init_threshold (float): The threshold to initialize for training JumpReLU SAEs.
+        jumprelu_bandwidth (float): Bandwidth for training JumpReLU SAEs.
         autocast (bool): Whether to use autocast during training. Saves vram.
         autocast_lm (bool): Whether to use autocast during activation fetching.
         compile_llm (bool): Whether to compile the LLM.
@@ -113,7 +119,7 @@ class LanguageModelSAERunnerConfig:
     hook_eval: str = "NOT_IN_USE"
     hook_layer: int = 0
     hook_head_index: Optional[int] = None
-    dataset_path: str = "NeelNanda/c4-tokenized-2b"
+    dataset_path: str = ""
     dataset_trust_remote_code: bool = True
     streaming: bool = True
     is_dataset_tokenized: bool = True
@@ -124,11 +130,15 @@ class LanguageModelSAERunnerConfig:
     )
 
     # SAE Parameters
+    architecture: Literal["standard", "gated", "jumprelu"] = "standard"
     d_in: int = 512
     d_sae: Optional[int] = None
     b_dec_init_method: str = "geometric_median"
-    expansion_factor: int = 4
-    activation_fn: str = "relu"  # relu, tanh-relu
+    expansion_factor: Optional[int] = (
+        None  # defaults to 4 if d_sae and expansion_factor is None
+    )
+    activation_fn: str = "relu"  # relu, tanh-relu, topk
+    activation_fn_kwargs: dict[str, Any] = field(default_factory=dict)  # for topk
     normalize_sae_decoder: bool = True
     noise_scale: float = 0.0
     from_pretrained_path: Optional[str] = None
@@ -146,6 +156,7 @@ class LanguageModelSAERunnerConfig:
     normalize_activations: str = (
         "none"  # none, expected_average_only_in (Anthropic April Update), constant_norm_rescale (Anthropic Feb Update)
     )
+    seqpos_slice: tuple[int | None, ...] = (None,)
 
     # Misc
     device: str = "cpu"
@@ -153,6 +164,8 @@ class LanguageModelSAERunnerConfig:
     seed: int = 42
     dtype: str = "float32"  # type: ignore #
     prepend_bos: bool = True
+    jumprelu_init_threshold: float = 0.001
+    jumprelu_bandwidth: float = 0.001
 
     # Performance - see compilation section of lm_runner.py for info
     autocast: bool = False  # autocast to autocast_dtype during training
@@ -219,12 +232,13 @@ class LanguageModelSAERunnerConfig:
     checkpoint_path: str = "checkpoints"
     verbose: bool = True
     model_kwargs: dict[str, Any] = field(default_factory=dict)
-    model_from_pretrained_kwargs: dict[str, Any] = field(default_factory=dict)
+    model_from_pretrained_kwargs: dict[str, Any] = field(
+        default_factory=lambda: {"center_writing_weights": False}
+    )
     sae_lens_version: str = field(default_factory=lambda: __version__)
     sae_lens_training_version: str = field(default_factory=lambda: __version__)
 
     def __post_init__(self):
-
         if self.resume:
             raise ValueError(
                 "Resuming is no longer supported. You can finetune a trained SAE using cfg.from_pretrained path."
@@ -239,7 +253,13 @@ class LanguageModelSAERunnerConfig:
                 self.hook_head_index,
             )
 
-        if not isinstance(self.expansion_factor, list):
+        if self.d_sae is not None and self.expansion_factor is not None:
+            raise ValueError("You can't set both d_sae and expansion_factor.")
+
+        if self.d_sae is None and self.expansion_factor is None:
+            self.expansion_factor = 4
+
+        if self.d_sae is None and self.expansion_factor is not None:
             self.d_sae = self.d_in * self.expansion_factor
         self.tokens_per_buffer = (
             self.train_batch_size_tokens * self.context_size * self.n_batches_in_buffer
@@ -273,6 +293,7 @@ class LanguageModelSAERunnerConfig:
             "none",
             "expected_average_only_in",
             "constant_norm_rescale",
+            "layer_norm",
         ]:
             raise ValueError(
                 f"normalize_activations must be none, expected_average_only_in, or constant_norm_rescale. Got {self.normalize_activations}"
@@ -339,6 +360,13 @@ class LanguageModelSAERunnerConfig:
         if self.use_ghost_grads:
             print("Using Ghost Grads.")
 
+        if self.context_size < 0:
+            raise ValueError(
+                f"The provided context_size is {self.context_size} is negative. Expecting positive context_size."
+            )
+
+        _validate_seqpos(seqpos=self.seqpos_slice, context_size=self.context_size)
+
     @property
     def total_training_tokens(self) -> int:
         return self.training_tokens + self.finetuning_tokens
@@ -349,6 +377,8 @@ class LanguageModelSAERunnerConfig:
 
     def get_base_sae_cfg_dict(self) -> dict[str, Any]:
         return {
+            # TEMP
+            "architecture": self.architecture,
             "d_in": self.d_in,
             "d_sae": self.d_sae,
             "dtype": self.dtype,
@@ -366,6 +396,9 @@ class LanguageModelSAERunnerConfig:
             "finetuning_scaling_factor": self.finetuning_method is not None,
             "sae_lens_training_version": self.sae_lens_training_version,
             "normalize_activations": self.normalize_activations,
+            "activation_fn_kwargs": self.activation_fn_kwargs,
+            "model_from_pretrained_kwargs": self.model_from_pretrained_kwargs,
+            "seqpos_slice": self.seqpos_slice,
         }
 
     def get_training_sae_cfg_dict(self) -> dict[str, Any]:
@@ -381,10 +414,11 @@ class LanguageModelSAERunnerConfig:
             "decoder_heuristic_init": self.decoder_heuristic_init,
             "init_encoder_as_decoder_transpose": self.init_encoder_as_decoder_transpose,
             "normalize_activations": self.normalize_activations,
+            "jumprelu_init_threshold": self.jumprelu_init_threshold,
+            "jumprelu_bandwidth": self.jumprelu_bandwidth,
         }
 
     def to_dict(self) -> dict[str, Any]:
-
         cfg_dict = {
             **self.__dict__,
             # some args may not be serializable by default
@@ -396,7 +430,6 @@ class LanguageModelSAERunnerConfig:
         return cfg_dict
 
     def to_json(self, path: str) -> None:
-
         if not os.path.exists(os.path.dirname(path)):
             os.makedirs(os.path.dirname(path))
 
@@ -407,6 +440,15 @@ class LanguageModelSAERunnerConfig:
     def from_json(cls, path: str) -> "LanguageModelSAERunnerConfig":
         with open(path + "cfg.json", "r") as f:
             cfg = json.load(f)
+
+        # ensure that seqpos slices is a tuple
+        # Ensure seqpos_slice is a tuple
+        if "seqpos_slice" in cfg:
+            if isinstance(cfg["seqpos_slice"], list):
+                cfg["seqpos_slice"] = tuple(cfg["seqpos_slice"])
+            elif not isinstance(cfg["seqpos_slice"], tuple):
+                cfg["seqpos_slice"] = (cfg["seqpos_slice"],)
+
         return cls(**cfg)
 
 
@@ -422,7 +464,7 @@ class CacheActivationsRunnerConfig:
     hook_name: str = "blocks.{layer}.hook_mlp_out"
     hook_layer: int = 0
     hook_head_index: Optional[int] = None
-    dataset_path: str = "NeelNanda/c4-tokenized-2b"
+    dataset_path: str = ""
     dataset_trust_remote_code: bool | None = None
     streaming: bool = True
     is_dataset_tokenized: bool = True
@@ -430,6 +472,13 @@ class CacheActivationsRunnerConfig:
     new_cached_activations_path: Optional[str] = (
         None  # Defaults to "activations/{dataset}/{model}/{full_hook_name}_{hook_head_index}"
     )
+
+    # if saving to huggingface, set hf_repo_id
+    hf_repo_id: Optional[str] = None
+    hf_num_shards: int | None = None
+    hf_revision: str = "main"
+    hf_is_private_repo: bool = False
+
     # dont' specify this since you don't want to load from disk with the cache runner.
     cached_activations_path: Optional[str] = None
     # SAE Parameters
@@ -441,6 +490,7 @@ class CacheActivationsRunnerConfig:
     store_batch_size_prompts: int = 32
     train_batch_size_tokens: int = 4096
     normalize_activations: str = "none"  # should always be none for activation caching
+    seqpos_slice: tuple[int | None, ...] = (None,)
 
     # Misc
     device: str = "cpu"
@@ -450,11 +500,9 @@ class CacheActivationsRunnerConfig:
     prepend_bos: bool = True
     autocast_lm: bool = False  # autocast lm during activation fetching
 
-    # Activation caching stuff
-    shuffle_every_n_buffers: int = 10
-    n_shuffles_with_last_section: int = 10
-    n_shuffles_in_entire_dir: int = 10
-    n_shuffles_final: int = 100
+    # Shuffle activations
+    shuffle: bool = True
+
     model_kwargs: dict[str, Any] = field(default_factory=dict)
     model_from_pretrained_kwargs: dict[str, Any] = field(default_factory=dict)
 
@@ -471,9 +519,18 @@ class CacheActivationsRunnerConfig:
         if self.act_store_device == "with_model":
             self.act_store_device = self.device
 
+        if self.context_size < 0:
+            raise ValueError(
+                f"The provided context_size is {self.context_size} is negative. Expecting positive context_size."
+            )
+
+        _validate_seqpos(seqpos=self.seqpos_slice, context_size=self.context_size)
+
 
 @dataclass
 class ToyModelSAERunnerConfig:
+    architecture: Literal["standard", "gated"] = "standard"
+
     # ReLu Model Parameters
     n_features: int = 5
     n_hidden: int = 2
@@ -527,6 +584,7 @@ class ToyModelSAERunnerConfig:
     def get_base_sae_cfg_dict(self) -> dict[str, Any]:
         # TO DO: Have the same hyperparameters as in the main sae runner.
         return {
+            "architecture": self.architecture,
             "d_in": self.d_in,
             "d_sae": self.d_sae,
             "dtype": self.dtype,
@@ -552,10 +610,21 @@ def _default_cached_activations_path(
     return path
 
 
+def _validate_seqpos(seqpos: tuple[int | None, ...], context_size: int) -> None:
+    # Ensure that the step-size is larger or equal to 1
+    if len(seqpos) == 3:
+        step_size = seqpos[2] or 1
+        assert (
+            step_size > 1
+        ), f"Ensure the step_size {seqpos[2]=} for sequence slicing is positive."
+    # Ensure that the choice of seqpos doesn't end up with an empty list
+    assert len(list(range(context_size))[slice(*seqpos)]) > 0
+
+
 @dataclass
 class PretokenizeRunnerConfig:
     tokenizer_name: str = "gpt2"
-    dataset_path: str = "NeelNanda/c4-10k"
+    dataset_path: str = ""
     dataset_trust_remote_code: bool | None = None
     split: str | None = "train"
     data_files: list[str] | None = None
@@ -566,11 +635,12 @@ class PretokenizeRunnerConfig:
     shuffle: bool = True
     seed: int | None = None
     streaming: bool = False
+    pretokenize_batch_size: int | None = 1000
 
     # special tokens
     begin_batch_token: int | Literal["bos", "eos", "sep"] | None = "bos"
     begin_sequence_token: int | Literal["bos", "eos", "sep"] | None = None
-    sequence_separator_token: int | Literal["bos", "eos", "sep"] | None = "eos"
+    sequence_separator_token: int | Literal["bos", "eos", "sep"] | None = "bos"
 
     # if saving locally, set save_path
     save_path: str | None = None

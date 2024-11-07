@@ -52,18 +52,13 @@ def test_make_neuronpedia_list_with_features():
 async def test_neuronpedia_autointerp():
     features = [
         NeuronpediaFeature(
-            modelId="gpt2-small",
+            modelId="example-model",
             layer=0,
-            dataset="att-kk",
-            feature=11,
-        ),
-        NeuronpediaFeature(
-            modelId="gpt2-small",
-            layer=0,
-            dataset="att-kk",
-            feature=12,
-        ),
+            dataset="test-np",
+            feature=0,
+        )
     ]
+
     await autointerp_neuronpedia_features(
         features=features,
         openai_api_key="your-oai-key",
@@ -71,4 +66,7 @@ async def test_neuronpedia_autointerp():
         autointerp_explainer_model_name="gpt-4-turbo-2024-04-09",
         autointerp_scorer_model_name="gpt-3.5-turbo",
         num_activations_to_use=5,
+        do_score=False,
+        save_to_disk=False,
+        upload_to_neuronpedia=True,
     )

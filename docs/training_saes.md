@@ -5,7 +5,7 @@ Methods development for training SAEs is rapidly evolving, so these docs may cha
 However, we are attempting to maintain this [tutorial](https://github.com/jbloomAus/SAELens/blob/main/tutorials/training_a_sparse_autoencoder.ipynb)
  [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://githubtocolab.com/jbloomAus/SAELens/blob/main/tutorials/training_a_sparse_autoencoder.ipynb).
 
- We encourage readers to join the [Open Source Mechanistic Interpretability Slack](https://join.slack.com/t/opensourcemechanistic/shared_invite/zt-1qosyh8g3-9bF3gamhLNJiqCL_QqLFrA) for support!
+ We encourage readers to join the [Open Source Mechanistic Interpretability Slack](https://join.slack.com/t/opensourcemechanistic/shared_invite/zt-2k0id7mv8-CsIgPLmmHd03RPJmLUcapw) for support!
 
 ## Basic training setup
 
@@ -22,6 +22,7 @@ However, we are attempting to maintain this [tutorial](https://github.com/jbloom
  - `l1_coefficient`: This controls how much sparsity the SAE will have after training.
  - `training_tokens`: The total tokens used for training.
  - `train_batch_size_tokens`: The batch size used for training. Adjust this to keep the GPU saturated.
+ -  `model_from_pretrained_kwargs`: A dictionary of keyword arguments to pass to HookedTransformer.from_pretrained when loading the model. It's best to set "center_writing_weights" to False (this will be the default in the future).
 
 A sample training run from the [tutorial](https://github.com/jbloomAus/SAELens/blob/main/tutorials/training_a_sparse_autoencoder.ipynb) is shown below:
 
@@ -95,7 +96,7 @@ As you can see, the training setup provides a large number of options to explore
 
 For any real training run, you should be logging to Weights and Biases (WandB). This will allow you to track your training progress and compare different runs. To enable WandB, set `log_to_wandb=True`. The `wandb_project` parameter in the config controls the project name in WandB. You can also control the logging frequency with `wandb_log_frequency` and `eval_every_n_wandb_logs`.
 
-A number of helpful metrics are logged to WandB, including the sparsity of the SAE, the mean squared error (MSE) of the SAE, dead features, and explained variance. These metrics can be used to monitor the training progress and adjust the training parameters. Below is a screenshot from one training run. 
+A number of helpful metrics are logged to WandB, including the sparsity of the SAE, the mean squared error (MSE) of the SAE, dead features, and explained variance. These metrics can be used to monitor the training progress and adjust the training parameters. Below is a screenshot from one training run.
 
 ![screenshot](dashboard_screenshot.png)
 
@@ -153,6 +154,19 @@ cfg = PretokenizeRunnerConfig(
 dataset = PretokenizeRunner(cfg).run()
 ```
 
+## List of Pretokenized datasets
+
+Below is a list of pre-tokenized datasets that can be used with SAELens. If you have a dataset you would like to add to this list, please open a PR!
+
+| Huggingface ID | Tokenizer | Source Dataset | context size | Created with SAELens |
+| --- | --- | --- | --- | --- |
+| [chanind/openwebtext-gemma](https://huggingface.co/datasets/chanind/openwebtext-gemma) | gemma | [Skylion007/openwebtext](https://huggingface.co/datasets/Skylion007/openwebtext) | 8192 | [Yes](https://huggingface.co/datasets/chanind/openwebtext-gemma/blob/main/sae_lens.json) |
+| [chanind/openwebtext-llama3](https://huggingface.co/datasets/chanind/openwebtext-llama3) | llama3 | [Skylion007/openwebtext](https://huggingface.co/datasets/Skylion007/openwebtext) | 8192 | [Yes](https://huggingface.co/datasets/chanind/openwebtext-llama3/blob/main/sae_lens.json) |
+| [apollo-research/Skylion007-openwebtext-tokenizer-EleutherAI-gpt-neox-20b](https://huggingface.co/datasets/apollo-research/Skylion007-openwebtext-tokenizer-EleutherAI-gpt-neox-20b) | EleutherAI/gpt-neox-20b | [Skylion007/openwebtext](https://huggingface.co/datasets/Skylion007/openwebtext) | 2048 | [No](https://huggingface.co/datasets/apollo-research/Skylion007-openwebtext-tokenizer-EleutherAI-gpt-neox-20b/blob/main/upload_script.py) |
+| [apollo-research/monology-pile-uncopyrighted-tokenizer-EleutherAI-gpt-neox-20b](https://huggingface.co/datasets/apollo-research/monology-pile-uncopyrighted-tokenizer-EleutherAI-gpt-neox-20b) | EleutherAI/gpt-neox-20b | [monology/pile-uncopyrighted](https://huggingface.co/datasets/monology/pile-uncopyrighted) | 2048 | [No](https://huggingface.co/datasets/apollo-research/monology-pile-uncopyrighted-tokenizer-EleutherAI-gpt-neox-20b/blob/main/upload_script.py) |
+| [apollo-research/monology-pile-uncopyrighted-tokenizer-gpt2](https://huggingface.co/datasets/apollo-research/monology-pile-uncopyrighted-tokenizer-gpt2) | gpt2 | [monology/pile-uncopyrighted](https://huggingface.co/datasets/monology/pile-uncopyrighted) | 1024 | [No](https://huggingface.co/datasets/apollo-research/monology-pile-uncopyrighted-tokenizer-gpt2/blob/main/upload_script.py) |
+| [apollo-research/Skylion007-openwebtext-tokenizer-gpt2](https://huggingface.co/datasets/apollo-research/Skylion007-openwebtext-tokenizer-gpt2) | gpt2 | [Skylion007/openwebtext](https://huggingface.co/datasets/Skylion007/openwebtext) | 1024 | [No](https://huggingface.co/datasets/apollo-research/Skylion007-openwebtext-tokenizer-gpt2/blob/main/upload_script.py) |
+
 ## Caching activations
 
 The next step in improving performance beyond pre-tokenizing datasets is to cache model activations. This allows you to pre-calculate all the training activations for your SAE in advance so the model does not need to be run during training to generate activations. This allows rapid training of SAEs and is especially helpful for experimenting with training hyperparameters. However, pre-calculating activations can take a very large amount of disk space, so it may not always be possible.
@@ -166,11 +180,36 @@ cfg = CacheActivationsRunnerConfig(
     model_name="tiny-stories-1L-21M",
     hook_name="blocks.0.hook_mlp_out",
     dataset_path="apollo-research/roneneldan-TinyStories-tokenizer-gpt2",
-    # ... 
-    new_cached_activations_path="./tiny-stories-1L-21M-cache"
+    # ...
+    new_cached_activations_path="./tiny-stories-1L-21M-cache",
+    hf_repo_id="your-username/tiny-stories-1L-21M-cache", # To push to hub
 )
 
 CacheActivationsRunner(cfg).run()
 ```
 
 To use the cached activations during training, set `use_cached_activations=True` and `cached_activations_path` to match the `new_cached_activations_path` above option in training configuration.
+
+
+## Uploading SAEs to Huggingface
+
+Once you have a set of SAEs that you're happy with, your next step is to share them with the world! SAELens has a `upload_saes_to_huggingface()` function which makes this easy to do. We also provide a [uploading saes to huggingface tutorial](https://github.com/jbloomAus/SAELens/blob/main/tutorials/uploading_saes_to_huggingface.ipynb) with more details.
+
+You'll just need to pass a dictionary of SAEs to upload along with the huggingface repo id to upload to. The dictionary keys will become the folders in the repo where each SAE will be located. It's best practice to use the hook point that the SAE was trained on as the key to make it clear to users where in the model to apply the SAE. The values of this dictionary can be either an SAE object, or a path to a saved SAE object on disk from the `sae.save_model()` method.
+
+A sample is shown below:
+
+```python
+from sae_lens import upload_saes_to_huggingface
+
+saes_dict = {
+    "blocks.0.hook_resid_pre": layer_0_sae,
+    "blocks.1.hook_resid_pre": layer_1_sae,
+    # ...
+}
+
+upload_saes_to_huggingface(
+    saes_dict,
+    hf_repo_id="your-username/your-sae-repo",
+)
+```
