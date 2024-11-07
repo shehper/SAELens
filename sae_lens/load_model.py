@@ -71,10 +71,14 @@ def load_nanogpt_model(ckpt_path, device):
         )
 
     # load state dict
-    from transformer_lens.loading_from_pretrained import convert_nanogpt_weights
+    from transformer_lens.pretrained.weight_conversions.nanogpt import convert_nanogpt_weights
     state_dict = checkpoint['model']
     new_state_dict = convert_nanogpt_weights(old_state_dict=state_dict, cfg=cfg)
     model = HookedTransformer(cfg)
     model.load_state_dict(new_state_dict, strict=False)
+
+    from transformers import GPT2Tokenizer
+    tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
+    model.set_tokenizer(tokenizer)
 
     return model
